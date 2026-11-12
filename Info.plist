@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>KlaD</string>
+	<key>CFBundleExecutable</key>
+	<string>KlaD</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>org.klad.KlaD</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>KlaD</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Free and open source software (MIT License).</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>KlaD measures how much space your Desktop uses. It only reads file sizes and never uploads anything.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>KlaD measures how much space your Documents folder uses. It only reads file sizes and never uploads anything.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>KlaD measures your Downloads folder to find old installers you may want to remove.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>KlaD can analyze storage on removable drives you choose to scan.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>KlaD can analyze storage on network volumes you choose to scan.</string>
+</dict>
+</plist>
