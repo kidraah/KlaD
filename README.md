@@ -45,7 +45,8 @@ Real example: a `uv` cache of 4.48 GB frees only 2.87 GB, because uv clones its 
 Command Line Tools are enough — no Xcode needed.
 
 ```sh
-make app          # release build → build/KlaD.app (ad-hoc signed, inside-out, no --deep)
+make signing-identity   # once: local signing identity so macOS remembers folder permissions
+make app          # release build → build/KlaD.app (inside-out signing, no --deep)
 make run          # build + open
 make test         # 141 Swift Testing tests
 make probe        # headless scanner: .build/release/klad-probe scan ~ | verify <dir> | volume /

@@ -7,26 +7,41 @@
 #   make probe      release build of the headless scanner probe
 #   make icon       regenerate Resources/AppIcon.icns
 #
-# Signing: SIGN_ID defaults to "-" (ad-hoc). Use a stable identity so macOS
-# privacy grants (Full Disk Access) survive rebuilds, e.g.
-#   make app SIGN_ID="Apple Development: Jane Doe (TEAMID)"
+# Signing: if the local identity from `make signing-identity` exists it is used,
+# so macOS remembers folder permissions across rebuilds; otherwise ad-hoc ("-").
+# Override with: make app SIGN_ID="Apple Development: Jane Doe (TEAMID)"
 
 APP_NAME   := KlaD
 BUILD_DIR  := build
 APP        := $(BUILD_DIR)/$(APP_NAME).app
 CONFIG     ?= release
+LOCAL_KEYCHAIN := $(HOME)/Library/Keychains/klad-signing.keychain-db
+LOCAL_PASSFILE := $(HOME)/.config/klad/signing-keychain-password
+HAS_LOCAL_ID   := $(shell security find-certificate -c "KlaD Local Signing" "$(LOCAL_KEYCHAIN)" >/dev/null 2>&1 && test -f "$(LOCAL_PASSFILE)" && echo yes)
+ifeq ($(HAS_LOCAL_ID),yes)
+SIGN_ID    ?= KlaD Local Signing
+SIGN_FLAGS := --keychain "$(LOCAL_KEYCHAIN)"
+else
 SIGN_ID    ?= -
+SIGN_FLAGS :=
+endif
 SWIFT      ?= swift
 BIN_DIR     = $(shell $(SWIFT) build -c $(CONFIG) --show-bin-path)
 
-.PHONY: all build app run scan-home test probe icon clean
+.PHONY: all build app run scan-home test probe icon clean signing-identity unlock-signing
 
 all: app
 
 build:
 	$(SWIFT) build -c $(CONFIG) --product $(APP_NAME)
 
-app: build
+signing-identity:
+	Scripts/make-signing-identity.sh
+
+unlock-signing:
+	@if [ "$(HAS_LOCAL_ID)" = yes ]; then security unlock-keychain -p "$$(cat $(LOCAL_PASSFILE))" "$(LOCAL_KEYCHAIN)"; fi
+
+app: build unlock-signing
 	@rm -rf "$(APP)"
 	@mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources"
 	@cp "$(BIN_DIR)/$(APP_NAME)" "$(APP)/Contents/MacOS/$(APP_NAME)"
@@ -34,8 +49,8 @@ app: build
 	@if [ -f Resources/AppIcon.icns ]; then cp Resources/AppIcon.icns "$(APP)/Contents/Resources/AppIcon.icns"; fi
 	@# Inside-out signing: nested code first (frameworks, dylibs, helpers), then the bundle.
 	@find "$(APP)/Contents" -depth \( -name "*.dylib" -o -name "*.framework" -o -name "*.xpc" -o -name "*.appex" \) \
-		-exec codesign --force --timestamp=none --options runtime --sign "$(SIGN_ID)" {} \; 2>/dev/null || true
-	@codesign --force --timestamp=none --options runtime --sign "$(SIGN_ID)" "$(APP)"
+		-exec codesign --force --timestamp=none --options runtime $(SIGN_FLAGS) --sign "$(SIGN_ID)" {} \; 2>/dev/null || true
+	@codesign --force --timestamp=none --options runtime $(SIGN_FLAGS) --sign "$(SIGN_ID)" "$(APP)"
 	@codesign --verify --strict --verbose=1 "$(APP)"
 	@echo "Built $(APP)"
 
