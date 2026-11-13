@@ -72,7 +72,7 @@ case "scan":
         print("shared:      \(formatBytes(m.sharedBytes))  (clones / snapshots / hard links)")
         print("cloud stubs: \(formatBytes(m.cloudStubBytes))")
         print("unreadable:  \(result.unreadableCount)  hardlink dups: \(result.hardLinkDuplicateCount)  PRIVATESIZE: \(result.privateSizeSupported)")
-        for issue in result.issues.prefix(5) { print("  ! \(issue.path): \(issue.message)") }
+        for issue in result.issues.prefix(args.contains("--issues") ? 500 : 5) { print("  ! \(issue.path): \(issue.message)") }
         print("top \(top):")
         for child in result.root.children.prefix(top) {
             print("  \(formatBytes(child.metrics.allocatedBytes).padding(toLength: 10, withPad: " ", startingAt: 0)) private \(formatBytes(child.metrics.privateBytes).padding(toLength: 10, withPad: " ", startingAt: 0)) \(child.name)")

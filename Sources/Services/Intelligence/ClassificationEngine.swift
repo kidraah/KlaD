@@ -9,6 +9,13 @@
 //
 // Convention shared with `DeveloperRulesCatalog`: a match whose ruleID starts with
 // "category." only contributes its category — no annotation, no recommendation.
+//
+// System policy (KlaDModels.SystemPolicy):
+//   • `.opaque` accounting nodes keep the scanner's annotation and category and are
+//     never evaluated by rules;
+//   • `.protectedLocation` nodes are annotated `doNotDelete` (never recommended);
+//   • a match whose action is `.moveToTrash` is downgraded to `.inspectOnly` (and not
+//     recommended) when `SystemPolicy.mayModify` says KlaD may never touch that path.
 
 import Foundation
 import KlaDModels
@@ -21,6 +28,7 @@ public final class ClassificationEngine: StorageClassifying {
     }
 
     private static let noCategory: UInt8 = .max
+    static let protectedRuleID = "system.protected_location"
     private static let categories: [StorageCategory] = {
         // rawValue is the index (contiguous 0…n-1).
         StorageCategory.allCases.sorted { $0.rawValue < $1.rawValue }
@@ -51,13 +59,32 @@ public final class ClassificationEngine: StorageClassifying {
         var stack: [Frame] = [Frame(node: root, prefix: "", inherited: Self.noCategory, enabled: true, isRoot: true)]
         while let frame = stack.popLast() {
             let node = frame.node
-            if node.annotation != nil { node.annotation = nil }   // idempotent re-classification
+            let isOpaque = node.isOpaque
+            // Idempotent re-classification — except the scanner's annotation on opaque nodes.
+            if !isOpaque && node.annotation != nil { node.annotation = nil }
 
             var category = frame.inherited
             var childrenEnabled = frame.enabled
             var childPrefix = ""
 
-            if frame.enabled {
+            if isOpaque {
+                // Synthetic accounting node ("macOS System (sealed)"): no rules, keep category.
+                category = node.category.rawValue
+                childrenEnabled = false
+            } else if node.isProtectedLocation {
+                let path = frame.isRoot ? root.path : (frame.enabled ? frame.prefix + node.name : node.path)
+                let location = SystemPolicy.protectedLocation(containing: path, home: context.homeDirectory)
+                category = (location?.category ?? .system).rawValue
+                node.annotation = NodeAnnotation(
+                    ruleID: Self.protectedRuleID,
+                    title: location?.title ?? "Protected macOS data",
+                    safety: .doNotDelete,
+                    group: .system,
+                    reason: location?.explanation ?? "Private macOS data that KlaD never opens or modifies."
+                )
+                annotated += 1
+                childrenEnabled = false
+            } else if frame.enabled {
                 let path = frame.isRoot ? root.path : frame.prefix + node.name
                 if let match = catalog.match(node: node, path: path, context: context) {
                     category = match.category.rawValue
@@ -68,7 +95,9 @@ public final class ClassificationEngine: StorageClassifying {
                             group: match.group, reason: Self.reason(for: match)
                         )
                         annotated += 1
-                        if match.recommend && node.metrics.allocatedBytes >= context.minimumRecommendationBytes {
+                        // Never offer the Trash outside what SystemPolicy lets KlaD modify.
+                        let blocked = match.action.isTrashable && !SystemPolicy.mayModify(path, home: context.homeDirectory)
+                        if match.recommend && !blocked && node.metrics.allocatedBytes >= context.minimumRecommendationBytes {
                             recommendations.append(Self.recommendation(for: node, path: path, match: match, context: context))
                         }
                     }

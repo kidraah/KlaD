@@ -82,6 +82,11 @@ public struct NodeFlags: OptionSet, Sendable, Hashable, Codable {
     public static let immutable               = NodeFlags(rawValue: 1 << 18)
     /// Some descendant was unreadable or the scan was cancelled — totals are a lower bound.
     public static let incompleteSubtree       = NodeFlags(rawValue: 1 << 19)
+    /// macOS-protected private data (SystemPolicy). Never opened, listed or read.
+    public static let protectedLocation       = NodeFlags(rawValue: 1 << 20)
+    /// Synthetic accounting node (e.g. the sealed macOS volume, hidden space):
+    /// sized from APFS volume totals, not a real path. Never revealed or trashed.
+    public static let opaque                  = NodeFlags(rawValue: 1 << 21)
 }
 
 /// Classification output attached to rule-matched nodes (allocated only for matches).
@@ -122,6 +127,10 @@ public final class FileTreeNode: @unchecked Sendable, Identifiable, Hashable, Cu
     public let modificationTime: Int64
     /// ATTR_CMNEXT_CLONEID (0 when unavailable). Equal ids ⇒ pure clones of the same data stream.
     public let cloneID: UInt64
+    /// Newest modification time of any FILE in the subtree (files: own mtime;
+    /// empty directories: own mtime). Folders' own dates are ignored because
+    /// Finder metadata writes bump them. Drives "colour by age".
+    public var newestModificationTime: Int64
 
     // MARK: Tree links
     public internal(set) weak var parent: FileTreeNode?
@@ -160,6 +169,7 @@ public final class FileTreeNode: @unchecked Sendable, Identifiable, Hashable, Cu
         self.cloneID = cloneID
         self.errorCode = errorCode
         self.category = category
+        self.newestModificationTime = modificationTime
         self.children = []
     }
 
@@ -178,6 +188,10 @@ public final class FileTreeNode: @unchecked Sendable, Identifiable, Hashable, Cu
     // MARK: Derived properties
 
     @inlinable public var isDirectory: Bool { kind == .directory }
+    /// A synthetic accounting node (no real path).
+    @inlinable public var isOpaque: Bool { flags.contains(.opaque) }
+    /// A macOS-protected location KlaD never opens.
+    @inlinable public var isProtectedLocation: Bool { flags.contains(.protectedLocation) }
     @inlinable public var isRoot: Bool { parent == nil }
     @inlinable public var hasChildren: Bool { !children.isEmpty }
 
@@ -357,13 +371,16 @@ public final class FileTreeNode: @unchecked Sendable, Identifiable, Hashable, Cu
         guard kind == .directory else { return }
         var total = StorageMetrics.zero
         var incomplete = flags.contains(.unreadable)
+        var newest: Int64 = children.isEmpty ? modificationTime : 0
         for child in children {
+            if !child.isOpaque { newest = max(newest, child.newestModificationTime) }
             total.add(child.aggregateContribution)
             if child.flags.contains(.incompleteSubtree) || child.flags.contains(.unreadable) {
                 incomplete = true
             }
         }
         metrics = total
+        newestModificationTime = newest
         if incomplete { flags.insert(.incompleteSubtree) } else { flags.remove(.incompleteSubtree) }
         if sort { sortChildrenBySize() }
     }
@@ -451,6 +468,19 @@ public final class FileTreeNode: @unchecked Sendable, Identifiable, Hashable, Cu
             modificationTime: modificationTime,
             cloneID: cloneID
         )
+    }
+
+    /// A synthetic accounting node (sealed system volume, hidden space…).
+    public static func opaque(_ name: String, bytes: UInt64, category: StorageCategory, annotation: NodeAnnotation) -> FileTreeNode {
+        let node = FileTreeNode(
+            name: name,
+            kind: .other,
+            metrics: StorageMetrics(logicalBytes: bytes, allocatedBytes: bytes, privateBytes: 0, fileCount: 0),
+            flags: [.opaque, .synthetic],
+            category: category
+        )
+        node.annotation = annotation
+        return node
     }
 
     /// A directory node with `children` attached (aggregates NOT computed —

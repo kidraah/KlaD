@@ -36,7 +36,15 @@ public final class FSEventsMonitor: FileSystemWatching, @unchecked Sendable {
         return running
     }
 
+    /// `FSEventsGetCurrentEventId()` — persist alongside a scan to replay later.
+    public var currentEventID: UInt64 { FSEventsGetCurrentEventId() }
+
+    /// Starts watching "from now" (no history replay).
     public func start(paths: [String], latency: TimeInterval) throws -> AsyncStream<DirtyPathBatch> {
+        try start(paths: paths, latency: latency, sinceEventID: nil)
+    }
+
+    public func start(paths: [String], latency: TimeInterval, sinceEventID: UInt64?) throws -> AsyncStream<DirtyPathBatch> {
         let watched = paths.filter { !$0.isEmpty }
         guard !watched.isEmpty else { throw FSEventsMonitorError.noPaths }
 
@@ -60,7 +68,7 @@ public final class FSEventsMonitor: FileSystemWatching, @unchecked Sendable {
         let flags = FSEventStreamCreateFlags(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagWatchRoot)
         guard let created = FSEventStreamCreate(
             kCFAllocatorDefault, fsEventsCallback, &context, watched as CFArray,
-            FSEventStreamEventId(kFSEventStreamEventIdSinceNow), max(0, latency), flags)
+            sinceEventID ?? FSEventStreamEventId(kFSEventStreamEventIdSinceNow), max(0, latency), flags)
         else {
             continuation.finish()
             throw FSEventsMonitorError.streamCreationFailed
@@ -150,11 +158,15 @@ public final class FSEventsMonitor: FileSystemWatching, @unchecked Sendable {
             return path
         }
 
-        func handle(paths: [String], flags: [UInt32], eventCount: Int) {
+        func handle(paths: [String], flags: [UInt32], eventIDs: [UInt64], eventCount: Int) {
             let mapped = paths.map { original(for: Self.stripTrailingSlash($0)) }
             let cover = FSEventsMonitor.minimalCover(paths: mapped, flags: flags)
-            guard !cover.isEmpty else { return }
-            continuation.yield(DirtyPathBatch(paths: cover, eventCount: eventCount, receivedAt: Date()))
+            let historyDone = flags.contains { $0 & UInt32(kFSEventStreamEventFlagHistoryDone) != 0 }
+            // A batch carrying only HistoryDone is still delivered (empty cover).
+            guard !cover.isEmpty || historyDone else { return }
+            continuation.yield(DirtyPathBatch(
+                paths: cover, eventCount: eventCount, receivedAt: Date(),
+                historyDone: historyDone, lastEventID: eventIDs.max() ?? 0))
         }
 
     }
@@ -198,11 +210,12 @@ public final class FSEventsMonitor: FileSystemWatching, @unchecked Sendable {
 }
 
 /// C callback: no captures; the `Sink` arrives through the context `info` pointer.
-private let fsEventsCallback: FSEventStreamCallback = { _, info, numEvents, eventPaths, eventFlags, _ in
+private let fsEventsCallback: FSEventStreamCallback = { _, info, numEvents, eventPaths, eventFlags, eventIDs in
     guard let info else { return }
     let sink = Unmanaged<FSEventsMonitor.Sink>.fromOpaque(info).takeUnretainedValue()
     let array = Unmanaged<CFArray>.fromOpaque(eventPaths).takeUnretainedValue() as NSArray
     guard let paths = array as? [String] else { return }
     let flags = Array(UnsafeBufferPointer(start: eventFlags, count: numEvents))
-    sink.handle(paths: paths, flags: flags, eventCount: numEvents)
+    let ids = Array(UnsafeBufferPointer(start: eventIDs, count: numEvents))
+    sink.handle(paths: paths, flags: flags, eventIDs: ids, eventCount: numEvents)
 }

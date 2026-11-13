@@ -23,7 +23,7 @@ struct DuplicateDetectorTests {
         setModificationTime(newest, seconds: 3_000_000)
 
         let candidates = [newest, oldest, middle, scratch.path + "/other.bin"].map { candidate($0) }
-        let groups = try await DuplicateDetectorService().findDuplicates(among: candidates, options: options, progress: nil)
+        let groups = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(among: candidates, options: options, progress: nil)
 
         let group = try #require(groups.first)
         #expect(groups.count == 1)
@@ -47,7 +47,7 @@ struct DuplicateDetectorTests {
         tweaked[MiB] ^= 0xFF
         let c = try scratch.file("c", bytes: base)
         let d = try scratch.file("d", bytes: tweaked)
-        let groups = try await DuplicateDetectorService().findDuplicates(
+        let groups = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(
             among: [a, b, c, d].map { candidate($0) }, options: options, progress: nil)
         #expect(groups.isEmpty)
     }
@@ -60,12 +60,12 @@ struct DuplicateDetectorTests {
         let stub = try scratch.file("stub", bytes: payload)
         #expect(chmod(stub, 0o000) == 0)
         let candidates = [candidate(a), candidate(b), candidate(stub, flags: .cloudPlaceholder)]
-        let groups = try await DuplicateDetectorService().findDuplicates(among: candidates, options: options, progress: nil)
+        let groups = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(among: candidates, options: options, progress: nil)
         #expect(groups.count == 1)
         #expect(groups.first?.paths.sorted() == [a, b].sorted())
         // Even a *non*-flagged unreadable file is merely skipped, never a crash/throw.
         let withUnreadable = [candidate(a), candidate(b), candidate(stub)]
-        let again = try await DuplicateDetectorService().findDuplicates(among: withUnreadable, options: options, progress: nil)
+        let again = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(among: withUnreadable, options: options, progress: nil)
         #expect(again.first?.paths.sorted() == [a, b].sorted())
     }
 
@@ -77,20 +77,20 @@ struct DuplicateDetectorTests {
         if !cloneOK { _ = try scratch.file("clone", bytes: try Data(contentsOf: URL(fileURLWithPath: original))) }
         // Real fileIDs differ; the scanner would report the same cloneID + sharesAllBlocks for both.
         let flags: NodeFlags = [.sharesAllBlocks, .mayShareBlocks]
-        let groups = try await DuplicateDetectorService().findDuplicates(
+        let groups = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(
             among: [candidate(original, flags: flags, cloneID: 4242), candidate(clonePath, flags: flags, cloneID: 4242)],
             options: options, progress: nil)
         #expect(groups.isEmpty)
 
         // A clone pair plus an independent identical copy ⇒ one group of 2 (clone counted once).
         let independent = try scratch.file("indep", bytes: try Data(contentsOf: URL(fileURLWithPath: original)))
-        let three = try await DuplicateDetectorService().findDuplicates(
+        let three = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(
             among: [candidate(original, flags: flags, cloneID: 4242), candidate(clonePath, flags: flags, cloneID: 4242), candidate(independent)],
             options: options, progress: nil)
         #expect(three.first?.paths.count == 2)
 
         // Same cloneID without a sharing flag is NOT trusted.
-        let unflagged = try await DuplicateDetectorService().findDuplicates(
+        let unflagged = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(
             among: [candidate(original, cloneID: 7), candidate(clonePath, cloneID: 7)], options: options, progress: nil)
         #expect(unflagged.count == 1)
     }
@@ -102,11 +102,11 @@ struct DuplicateDetectorTests {
         #expect(Darwin.link(original, link) == 0)
         let a = candidate(original), b = candidate(link)
         #expect(a.fileID == b.fileID)
-        let groups = try await DuplicateDetectorService().findDuplicates(among: [a, b], options: options, progress: nil)
+        let groups = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(among: [a, b], options: options, progress: nil)
         #expect(groups.isEmpty)
         // Flagged duplicates are dropped outright.
         let other = try scratch.file("copy", bytes: try Data(contentsOf: URL(fileURLWithPath: original)))
-        let flagged = try await DuplicateDetectorService().findDuplicates(
+        let flagged = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(
             among: [candidate(original), candidate(other, flags: .hardLinkDuplicate)], options: options, progress: nil)
         #expect(flagged.isEmpty)
     }
@@ -121,7 +121,7 @@ struct DuplicateDetectorTests {
         var viaLink = candidate(a); viaLink.path = link; viaLink.fileID = 999_999_999
         var stale = candidate(b); stale.path = try scratch.file("stale", bytes: payload + Data([1]))
         stale.fileID = 888_888_888
-        let groups = try await DuplicateDetectorService().findDuplicates(
+        let groups = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(
             among: [candidate(a), viaLink, stale], options: options, progress: nil)
         #expect(groups.isEmpty)
     }
@@ -131,13 +131,13 @@ struct DuplicateDetectorTests {
         let payload = randomData(2 * MiB)
         let a = try scratch.file("a", bytes: payload), b = try scratch.file("b", bytes: payload)
         let candidates = [candidate(a), candidate(b)]
-        let small = try await DuplicateDetectorService().findDuplicates(
+        let small = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(
             among: candidates, options: DuplicateScanOptions(minimumBytes: 4 << 20), progress: nil)
         #expect(small.isEmpty)
-        let starved = try await DuplicateDetectorService().findDuplicates(
+        let starved = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(
             among: candidates, options: DuplicateScanOptions(minimumBytes: 1 << 20, maxBytesToHash: 1024), progress: nil)
         #expect(starved.isEmpty)
-        let exact = try await DuplicateDetectorService().findDuplicates(
+        let exact = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(
             among: candidates, options: DuplicateScanOptions(minimumBytes: 1 << 20, maxBytesToHash: UInt64(4 * MiB)), progress: nil)
         #expect(exact.count == 1)
     }
@@ -147,7 +147,7 @@ struct DuplicateDetectorTests {
         let small = randomData(2 * MiB), large = randomData(3 * MiB)
         let paths = [try scratch.file("s1", bytes: small), try scratch.file("s2", bytes: small),
                      try scratch.file("l1", bytes: large), try scratch.file("l2", bytes: large)]
-        let groups = try await DuplicateDetectorService(maxConcurrentFiles: 2).findDuplicates(
+        let groups = try await DuplicateDetectorService(maxConcurrentFiles: 2, homeDirectory: scratch.path).findDuplicates(
             among: paths.map { candidate($0) }, options: options, progress: nil)
         #expect(groups.count == 2)
         #expect(groups[0].fileSize == UInt64(3 * MiB))
@@ -159,13 +159,96 @@ struct DuplicateDetectorTests {
         let payload = randomData(2 * MiB)
         let paths = [try scratch.file("a", bytes: payload), try scratch.file("b", bytes: payload)]
         let seen = LockedBox<[DuplicateScanProgress]>([])
-        _ = try await DuplicateDetectorService().findDuplicates(
+        _ = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(
             among: paths.map { candidate($0) }, options: options, progress: { p in seen.mutate { $0.append(p) } })
         let phases = seen.value.map(\.phase)
         #expect(phases.first == .groupingBySize)
         #expect(phases.last == .finished)
         #expect(phases.contains(.fullHashing))
         #expect((seen.value.last?.bytesHashed ?? 0) == UInt64(4 * MiB))
+    }
+
+    // MARK: Keep the original-looking copy
+
+    private func writeCopies(_ scratch: ScratchDir, _ relativePaths: [String], payload: Data) throws -> [String] {
+        try relativePaths.map { relative in
+            let path = scratch.path + "/" + relative
+            try FileManager.default.createDirectory(
+                atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            try payload.write(to: URL(fileURLWithPath: path))
+            return path
+        }
+    }
+
+    @Test func copyNamedFilesAreNeverKept() async throws {
+        let scratch = try ScratchDir("dup"); defer { scratch.cleanup() }
+        let paths = try writeCopies(scratch, ["report copy.pdf", "report 2.pdf", "report (1).pdf", "report-1.pdf", "report.pdf"],
+                                    payload: randomData(2 * MiB))
+        // The original is NEWEST and has the longest path of the group's "clean" names; copies are older.
+        for (index, path) in paths.enumerated() { setModificationTime(path, seconds: 1_000_000 + index * 1000) }
+        setModificationTime(paths[4], seconds: 9_000_000)
+        let groups = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(
+            among: paths.map { candidate($0) }, options: options, progress: nil)
+        let group = try #require(groups.first)
+        #expect(group.paths.first == scratch.path + "/report.pdf")
+        #expect(group.paths.count == 5)
+    }
+
+    @Test func copyNameDetection() {
+        for name in ["a copy.txt", "a copy 2.txt", "a (3).txt", "a-1.txt", "a 2.txt", "Copy of a.txt", "A Copy.TXT"] {
+            #expect(DuplicateDetectorService.isCopyNamed(fileName: name), "\(name)")
+        }
+        for name in ["a.txt", "IMG_1234.jpg", "copyright.txt", "v2.txt", "photo2024.png", "notes.copy"] {
+            #expect(!DuplicateDetectorService.isCopyNamed(fileName: name), "\(name)")
+        }
+    }
+
+    @Test func downloadsTrashBackupAndOldFoldersAreKeptLast() async throws {
+        let scratch = try ScratchDir("dup"); defer { scratch.cleanup() }
+        let paths = try writeCopies(
+            scratch, ["Downloads/a.bin", ".Trash/a.bin", "Backups/a.bin", "old/a.bin", "Projects/a.bin"], payload: randomData(2 * MiB))
+        // Make the low-priority ones the OLDEST so only the location rule can demote them.
+        for (index, path) in paths.enumerated() { setModificationTime(path, seconds: 1_000_000 + index * 1000) }
+        setModificationTime(paths[4], seconds: 9_000_000)
+        // ".Trash" is not allowed by the home policy only at top level; it IS inside home but protected ⇒ filtered out.
+        let groups = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(
+            among: paths.map { candidate($0) }, options: options, progress: nil)
+        let group = try #require(groups.first)
+        #expect(group.paths.first == scratch.path + "/Projects/a.bin")
+        #expect(!group.paths.contains(scratch.path + "/.Trash/a.bin"), "Trash is protected and never offered")
+        #expect(group.paths.last != scratch.path + "/Projects/a.bin")
+    }
+
+    @Test func orderThenOldestThenShortestPath() async throws {
+        let scratch = try ScratchDir("dup"); defer { scratch.cleanup() }
+        let paths = try writeCopies(scratch, ["x/newer.bin", "x/older.bin", "x/deeper/same-age-long-name.bin", "x/same-age.bin"],
+                                    payload: randomData(2 * MiB))
+        setModificationTime(paths[0], seconds: 5_000_000)
+        setModificationTime(paths[1], seconds: 1_000_000)
+        setModificationTime(paths[2], seconds: 3_000_000)
+        setModificationTime(paths[3], seconds: 3_000_000)
+        let groups = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(
+            among: paths.map { candidate($0) }, options: options, progress: nil)
+        let group = try #require(groups.first)
+        #expect(group.paths == [paths[1], paths[3], paths[2], paths[0]])   // oldest, then same age shortest, longer, newest
+    }
+
+    @Test func candidatesOutsideTheHomePolicyAreSkipped() async throws {
+        let home = try ScratchDir("home"); defer { home.cleanup() }
+        let elsewhere = try ScratchDir("elsewhere"); defer { elsewhere.cleanup() }
+        let payload = randomData(2 * MiB)
+        let inHome = try writeCopies(home, ["keep/a.bin", "keep/b.bin"], payload: payload)
+        let outside = try elsewhere.file("c.bin", bytes: payload)
+        let protectedCopy = try writeCopies(home, ["Library/Mail/d.bin", "Library/e.bin"], payload: payload)
+        let service = DuplicateDetectorService(homeDirectory: home.path)
+        let groups = try await service.findDuplicates(
+            among: (inHome + [outside] + protectedCopy).map { candidate($0) }, options: options, progress: nil)
+        let group = try #require(groups.first)
+        #expect(group.paths.sorted() == inHome.sorted())
+        // Only one allowed copy ⇒ no group at all.
+        let none = try await service.findDuplicates(
+            among: [inHome[0], outside, protectedCopy[0]].map { candidate($0) }, options: options, progress: nil)
+        #expect(none.isEmpty)
     }
 
     @Test func cancellationThrows() async throws {
@@ -176,7 +259,7 @@ struct DuplicateDetectorTests {
         let opts = options
         let task = Task {
             while !Task.isCancelled { await Task.yield() }
-            return try await DuplicateDetectorService().findDuplicates(among: candidates, options: opts, progress: nil)
+            return try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(among: candidates, options: opts, progress: nil)
         }
         task.cancel()
         await #expect(throws: CancellationError.self) { try await task.value }

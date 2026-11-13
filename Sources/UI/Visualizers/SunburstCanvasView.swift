@@ -1,17 +1,16 @@
-// SunburstCanvasView.swift — LoD sunburst with polar zoom transitions
+// SunburstCanvasView.swift — LoD sunburst with polar zoom transitions.
 //
-// • Geometry is cached per (focus, measure, tree version); resizing only
-//   re-derives radii at draw time.
-// • The base layer is an Equatable view: hover state lives in a separate
-//   overlay Canvas, so pointer movement never redraws thousands of arcs.
-// • Drill-down / drill-up animate with a PolarTransform interpolated on a
-//   TimelineView clock (only ticking while a transition runs).
+// • Geometry cached per (focus, measure, colour mode, tree version).
+// • The arcs live in an Equatable base layer; hover is a separate overlay, so
+//   pointer movement never redraws thousands of arcs.
+// • Zoom transitions honour Reduce Motion.
 
 import SwiftUI
 import KlaDModels
 
 struct SunburstCanvasView: View {
     @Environment(AppState.self) private var app
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var geometry: SunburstGeometry?
     @State private var hovered: SunburstGeometry.Hit?
@@ -20,11 +19,12 @@ struct SunburstCanvasView: View {
     private struct Key: Equatable {
         let focus: ObjectIdentifier?
         let measure: SizeMeasure
+        let mode: ColorMode
         let version: Int
     }
 
     private var key: Key {
-        Key(focus: app.focus.map(ObjectIdentifier.init), measure: app.measure, version: app.treeVersion)
+        Key(focus: app.focus.map(ObjectIdentifier.init), measure: app.measure, mode: app.colorMode, version: app.treeVersion)
     }
 
     var body: some View {
@@ -57,9 +57,12 @@ struct SunburstCanvasView: View {
                 handleTap(at: point, size: proxy.size)
             }
             .contextMenu { contextMenu }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Sunburst chart of \(app.focus?.displayName ?? "")")
+            .accessibilityValue(app.focus.map { formatBytes($0.metrics.value(for: app.measure)) } ?? "")
         }
         .onAppear { rebuild(animated: false) }
-        .onChange(of: key) { _, _ in rebuild(animated: true) }
+        .onChange(of: key) { _, _ in rebuild(animated: !reduceMotion) }
     }
 
     // MARK: Interaction
@@ -90,15 +93,7 @@ struct SunburstCanvasView: View {
     @ViewBuilder
     private var contextMenu: some View {
         if let node = node(for: hovered) {
-            Button("Reveal in Finder") { SystemActions.reveal(node.path) }
-            Button("Copy Path") { SystemActions.copy(node.path) }
-            if node.isDirectory && node.hasChildren {
-                Button("Zoom Into \(node.name)") { app.drill(into: node) }
-            }
-            if app.canTrash(node) {
-                Divider()
-                Button("Move to Trash…") { app.requestCleanup(node: node) }
-            }
+            NodeContextMenu(node: node)
         }
         if app.focus?.parent != nil {
             Divider()
@@ -114,15 +109,13 @@ struct SunburstCanvasView: View {
             return
         }
         let old = geometry
-        let new = SunburstGeometry(focus: focus, measure: app.measure)
+        let new = SunburstGeometry(focus: focus, measure: app.measure, colorMode: app.colorMode)
         var from = PolarTransform.identity
         if animated, let old, old.measure == new.measure, old.focus !== focus {
             if let index = old.index(of: focus) {
-                // Drill down: the new focus grows from its old arc.
                 let s = old.segments[index]
                 from = PolarTransform(scale: s.span / (2 * .pi), pivot: 0, offset: s.start, ringShift: Double(s.ring))
             } else if let index = new.index(of: old.focus) {
-                // Drill up: the old focus shrinks back into its arc.
                 let s = new.segments[index]
                 from = PolarTransform(scale: (2 * .pi) / max(s.span, 0.0001), pivot: s.start, offset: 0, ringShift: -Double(s.ring))
             }
@@ -138,32 +131,23 @@ struct SunburstCanvasView: View {
     private func centerLabel(geometry: SunburstGeometry, size: CGSize) -> some View {
         let m = geometry.metrics(in: size)
         let info = readout(geometry: geometry)
-        VStack(spacing: 3) {
-            if let category = info.category {
-                CategoryDot(category: category, size: 7)
-            }
+        VStack(spacing: 2) {
             Text(info.title)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Theme.textPrimary)
+                .font(.headline)
                 .lineLimit(2)
                 .multilineTextAlignment(.center)
             Text(info.value)
-                .font(.system(size: 20, weight: .bold, design: .rounded))
+                .font(.title2.weight(.semibold))
                 .monospacedDigit()
-                .foregroundStyle(Theme.textPrimary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
             Text(info.caption)
-                .font(.system(size: 10.5, weight: .medium))
-                .foregroundStyle(Theme.textSecondary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
                 .lineLimit(2)
                 .multilineTextAlignment(.center)
-            if info.isFocus && geometry.focus.parent != nil {
-                Label("Click to zoom out", systemImage: "arrow.up.left.and.arrow.down.right")
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(Theme.textTertiary)
-                    .labelStyle(.titleAndIcon)
-            }
         }
-        .frame(width: m.holeRadius * 1.7)
+        .frame(width: m.holeRadius * 1.65)
         .position(m.center)
     }
 
@@ -171,34 +155,22 @@ struct SunburstCanvasView: View {
         var title: String
         var value: String
         var caption: String
-        var category: StorageCategory?
-        var isFocus: Bool
     }
 
     private func readout(geometry: SunburstGeometry) -> Readout {
         let total = max(geometry.total, 1)
         if case .segment(let index) = hovered {
             let segment = geometry.segments[index]
-            let percent = Double(segment.value) / Double(total) * 100
+            let percent = (Double(segment.value) / Double(total)).formatted(.percent.precision(.fractionLength(1)))
             if let node = segment.node {
-                var caption = String(format: "%.1f%% of %@", percent, geometry.focus.displayName)
-                if node.isDirectory { caption += " · \(formatCount(UInt64(node.metrics.fileCount))) files" }
-                return Readout(title: node.name, value: formatBytes(segment.value), caption: caption,
-                               category: node.category, isFocus: false)
+                return Readout(title: node.name, value: formatBytes(segment.value),
+                               caption: "\(percent) of \(geometry.focus.displayName)")
             }
-            return Readout(title: "\(segment.aggregateCount) smaller items",
-                           value: formatBytes(segment.value),
-                           caption: String(format: "%.1f%% · merged for clarity", percent),
-                           category: nil, isFocus: false)
+            return Readout(title: "\(segment.aggregateCount) Smaller Items", value: formatBytes(segment.value), caption: percent)
         }
         let focus = geometry.focus
-        return Readout(
-            title: focus.displayName,
-            value: formatBytes(geometry.total),
-            caption: "\(app.measure.displayName) · \(formatCount(UInt64(focus.metrics.fileCount))) files",
-            category: nil,
-            isFocus: true
-        )
+        let caption = focus.parent == nil ? app.measure.displayName : "Click to go back"
+        return Readout(title: focus.displayName, value: formatBytes(geometry.total), caption: caption)
     }
 }
 
@@ -206,20 +178,16 @@ struct SunburstCanvasView: View {
 struct ZoomTransition<T: Equatable & Sendable>: Equatable, Sendable {
     var from: T
     var start: Date
-    static var duration: TimeInterval { 0.55 }
+    static var duration: TimeInterval { 0.45 }
 
-    /// Eased progress 0…1 at `date`.
     func progress(at date: Date) -> Double {
         let raw = min(max(date.timeIntervalSince(start) / Self.duration, 0), 1)
-        // easeInOutCubic
         return raw < 0.5 ? 4 * raw * raw * raw : 1 - pow(-2 * raw + 2, 3) / 2
     }
 
     func isRunning(at date: Date) -> Bool { date.timeIntervalSince(start) < Self.duration }
 }
 
-/// The expensive layer: all arcs. Re-evaluated only when geometry or the
-/// transition changes (Equatable), never on hover.
 private struct SunburstBaseLayer: View, Equatable {
     let geometry: SunburstGeometry
     let transition: ZoomTransition<PolarTransform>
@@ -232,15 +200,13 @@ private struct SunburstBaseLayer: View, Equatable {
         TimelineView(.animation(minimumInterval: nil, paused: !transition.isRunning(at: Date()))) { timeline in
             let t = transition.progress(at: timeline.date)
             let transform = transition.from.interpolated(to: .identity, t)
-            Canvas(opaque: false, colorMode: .linear, rendersAsynchronously: false) { context, size in
-                geometry.draw(in: &context, size: size, transform: transform, separator: Theme.obsidian.opacity(0.9))
+            Canvas { context, size in
+                geometry.draw(in: &context, size: size, transform: transform, separator: VisualizerPalette.separator)
             }
         }
-        .drawingGroup()
     }
 }
 
-/// Cheap overlay: hovered arc + ancestry + selection outline.
 private struct SunburstOverlayLayer: View {
     let geometry: SunburstGeometry
     let hovered: SunburstGeometry.Hit?
@@ -257,20 +223,20 @@ private struct SunburstOverlayLayer: View {
             }
             if case .segment(let index) = hovered {
                 for ancestor in geometry.ancestry(of: index).dropLast() {
-                    context.fill(sector(ancestor), with: .color(Color.white.opacity(0.10)))
+                    context.fill(sector(ancestor), with: .color(Color.primary.opacity(0.07)))
                 }
                 let path = sector(index, grow: 3)
-                context.fill(path, with: .color(Color.white.opacity(0.22)))
-                context.stroke(path, with: .color(Color.white.opacity(0.85)), lineWidth: 1.2)
+                context.fill(path, with: .color(Color.primary.opacity(0.14)))
+                context.stroke(path, with: .color(Color.primary.opacity(0.75)), lineWidth: 1)
             }
             if let selectedIndex {
-                context.stroke(sector(selectedIndex), with: .color(Theme.accent), lineWidth: 2)
+                context.stroke(sector(selectedIndex), with: .color(.accentColor), lineWidth: 2.5)
             }
-            // Center disc.
-            let hole = Path(ellipseIn: CGRect(x: m.center.x - m.holeRadius + 2, y: m.center.y - m.holeRadius + 2,
-                                              width: (m.holeRadius - 2) * 2, height: (m.holeRadius - 2) * 2))
-            context.fill(hole, with: .color(hovered == .center ? Color.white.opacity(0.07) : Color.white.opacity(0.025)))
-            context.stroke(hole, with: .color(Theme.hairline), lineWidth: 1)
+            if hovered == .center {
+                let hole = Path(ellipseIn: CGRect(x: m.center.x - m.holeRadius + 2, y: m.center.y - m.holeRadius + 2,
+                                                  width: (m.holeRadius - 2) * 2, height: (m.holeRadius - 2) * 2))
+                context.fill(hole, with: .color(Color.primary.opacity(0.06)))
+            }
         }
     }
 }

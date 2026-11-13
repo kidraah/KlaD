@@ -39,9 +39,13 @@ final class TreemapGeometry: @unchecked Sendable {
     let total: UInt64
     let identity = UUID()
 
-    init(focus: FileTreeNode, measure: SizeMeasure, size: CGSize, maxDepth: Int = TreemapGeometry.defaultMaxDepth) {
+    let colorMode: ColorMode
+
+    init(focus: FileTreeNode, measure: SizeMeasure, size: CGSize, colorMode: ColorMode = .category,
+         maxDepth: Int = TreemapGeometry.defaultMaxDepth) {
         self.focus = focus
         self.measure = measure
+        self.colorMode = colorMode
         self.size = size
         self.maxDepth = maxDepth
         self.total = VisualizerMath.value(focus, measure)
@@ -85,7 +89,7 @@ final class TreemapGeometry: @unchecked Sendable {
             guard itemRect.width >= 1, itemRect.height >= 1 else { continue }
             let color: Color
             if let child = item.node {
-                color = VisualizerPalette.color(for: child, depth: depth, siblingIndex: sibling)
+                color = VisualizerPalette.color(for: child, depth: 1, siblingIndex: sibling, mode: colorMode)
             } else {
                 color = VisualizerPalette.aggregate
             }
@@ -193,21 +197,16 @@ final class TreemapGeometry: @unchecked Sendable {
         for tile in tiles {
             let rect = tile.rect.applying(transform)
             if rect.width < 0.5 || rect.height < 0.5 { continue }
-            let path = Path(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), cornerRadius: min(3, rect.width / 4, rect.height / 4))
+            let path = Path(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), cornerRadius: min(4, rect.width / 4, rect.height / 4), style: .continuous)
             if tile.isContainer {
-                context.fill(path, with: .color(tile.color.opacity(0.22)))
-                context.stroke(path, with: .color(tile.color.opacity(0.55)), lineWidth: 1)
+                context.fill(path, with: .color(tile.color.opacity(0.18)))
+                context.stroke(path, with: .color(tile.color.opacity(0.6)), lineWidth: 1)
             } else if tile.isAggregate {
-                context.fill(path, with: .color(tile.color.opacity(0.9)))
+                context.fill(path, with: .color(VisualizerPalette.aggregate))
                 context.stroke(path, with: .color(VisualizerPalette.aggregateStroke), style: StrokeStyle(lineWidth: 0.5, dash: [2, 2]))
             } else {
-                // Cushion: diagonal light falloff.
-                context.fill(path, with: .linearGradient(
-                    Gradient(colors: [tile.color.opacity(1), tile.color.opacity(0.72)]),
-                    startPoint: CGPoint(x: rect.minX, y: rect.minY),
-                    endPoint: CGPoint(x: rect.maxX, y: rect.maxY)
-                ))
-                context.stroke(path, with: .color(Theme.obsidian.opacity(0.75)), lineWidth: 0.75)
+                context.fill(path, with: .color(tile.color))
+                context.stroke(path, with: .color(VisualizerPalette.separator), lineWidth: 1)
             }
             guard identity else { continue }
             drawLabel(for: tile, rect: rect, in: &context)
@@ -217,18 +216,20 @@ final class TreemapGeometry: @unchecked Sendable {
     private func drawLabel(for tile: TreemapTile, rect: CGRect, in context: inout GraphicsContext) {
         if tile.isContainer {
             guard rect.width > 70, rect.height > 56, let node = tile.node else { return }
-            let text = Text("\(node.name)  ").font(.system(size: 10.5, weight: .semibold)).foregroundColor(.white.opacity(0.9))
-                + Text(formatBytes(tile.value)).font(.system(size: 10, weight: .medium)).foregroundColor(.white.opacity(0.55))
+            let text = Text(node.name).font(.caption.weight(.semibold)).foregroundColor(.primary)
+                + Text("  " + formatBytes(tile.value)).font(.caption).foregroundColor(.secondary)
             context.draw(text, in: CGRect(x: rect.minX + 6, y: rect.minY + 2, width: rect.width - 12, height: Self.headerHeight))
             return
         }
         guard rect.width > 64, rect.height > 30 else { return }
+        let dark = tile.node.map { colorMode == .category && $0.category.prefersDarkLabel } ?? false
+        let ink: Color = tile.isAggregate ? .secondary : (dark ? .black.opacity(0.85) : .white)
         let title = tile.node?.name ?? "\(tile.aggregateCount) smaller items"
-        let text = Text(title).font(.system(size: 10.5, weight: .semibold)).foregroundColor(.white.opacity(0.95))
-        let size = Text(formatBytes(tile.value)).font(.system(size: 9.5, weight: .medium)).foregroundColor(.white.opacity(0.7))
-        context.draw(text, in: CGRect(x: rect.minX + 6, y: rect.minY + 4, width: rect.width - 12, height: 14))
+        context.draw(Text(title).font(.caption.weight(.semibold)).foregroundColor(ink),
+                     in: CGRect(x: rect.minX + 6, y: rect.minY + 4, width: rect.width - 12, height: 14))
         if rect.height > 44 {
-            context.draw(size, in: CGRect(x: rect.minX + 6, y: rect.minY + 18, width: rect.width - 12, height: 13))
+            context.draw(Text(formatBytes(tile.value)).font(.caption2).foregroundColor(ink.opacity(0.8)),
+                         in: CGRect(x: rect.minX + 6, y: rect.minY + 18, width: rect.width - 12, height: 13))
         }
     }
 }

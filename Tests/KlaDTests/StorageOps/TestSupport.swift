@@ -17,7 +17,10 @@ struct ScratchDir {
     func cleanup() {
         // Restore permissions so chmod 000 fixtures can be removed.
         if let items = FileManager.default.enumerator(atPath: path) {
-            for case let rel as String in items { _ = chmod(path + "/" + rel, 0o700) }
+            for case let rel as String in items {
+                _ = chflags(path + "/" + rel, 0)   // clear uchg etc. so the fixture can be removed
+                _ = chmod(path + "/" + rel, 0o700)
+            }
         }
         try? FileManager.default.removeItem(at: url)
     }

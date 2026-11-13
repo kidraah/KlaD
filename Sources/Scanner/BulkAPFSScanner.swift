@@ -25,6 +25,10 @@ import KlaDModels
 public enum ScannerError: Error, LocalizedError, Sendable {
     case rootNotFound(path: String, errorCode: Int32)
     case rootNotDirectory(path: String)
+    /// The folder is macOS-protected private data; KlaD never opens it.
+    case protectedLocation(path: String, title: String)
+    /// A system location; KlaD never enumerates it (use Macintosh HD instead).
+    case systemLocation(path: String)
 
     public var errorDescription: String? {
         switch self {
@@ -32,6 +36,10 @@ public enum ScannerError: Error, LocalizedError, Sendable {
             return "Cannot open \(path): \(String(cString: strerror(code)))"
         case .rootNotDirectory(let path):
             return "\(path) is not a folder"
+        case .protectedLocation(_, let title):
+            return "\(title) is private data protected by macOS. KlaD never opens it."
+        case .systemLocation(let path):
+            return "\(path) is part of macOS. KlaD never opens system locations — choose Macintosh HD to see how much space the system uses."
         }
     }
 }
@@ -41,6 +49,11 @@ public final class BulkAPFSScanner: StorageScanning {
 
     public func scan(_ options: ScanOptions, progress: @escaping @Sendable (ScanProgress) -> Void) async throws -> ScanResult {
         let session = try ScanSession(options: options, rootName: nil, progress: progress)
+        if session.rootPath == "/" {
+            // Whole disk: user areas are enumerated; the system volume, other APFS
+            // volumes and protected data are sized from APFS container accounting.
+            session.wholeDiskVolume = await APFSVolumeInspector().report(forPath: "/")
+        }
         return try await Self.runOffCooperativePool(session)
     }
 
@@ -64,7 +77,7 @@ public final class BulkAPFSScanner: StorageScanning {
                     continuation.resume(returning: session.run())
                 }
                 thread.name = "klad.scan.coordinator"
-                thread.qualityOfService = .userInitiated
+                thread.qualityOfService = session.options.lowPriority ? .utility : .userInitiated
                 thread.start()
             }
         } onCancel: {
@@ -164,6 +177,10 @@ final class ScanSession: @unchecked Sendable {
     let threadCount: Int
     let progress: (@Sendable (ScanProgress) -> Void)?
 
+    /// Set before `run()` for whole-disk scans.
+    var wholeDiskVolume: VolumeSpaceReport?
+    /// Clone-aware allocation estimate (each pure-clone data stream counted once).
+    private let uniqueAllocation = OSAllocatedUnfairLock(initialState: (bytes: UInt64(0), clones: Set<UInt64>()))
     private let queue = DirectoryWorkQueue()
     private let stats = OSAllocatedUnfairLock(initialState: SharedStats())
     private let cancelledFlag = OSAllocatedUnfairLock(initialState: false)
@@ -181,6 +198,29 @@ final class ScanSession: @unchecked Sendable {
         var st = stat()
         guard lstat(rootPath, &st) == 0 else { throw ScannerError.rootNotFound(path: rootPath, errorCode: errno) }
         guard (st.st_mode & S_IFMT) == S_IFDIR else { throw ScannerError.rootNotDirectory(path: rootPath) }
+        try Self.checkPolicy(rootPath)
+    }
+
+    /// Refuses protected and system roots before anything is opened.
+    static func checkPolicy(_ path: String) throws {
+        let home = NSHomeDirectory()
+        if let location = SystemPolicy.protectedLocation(containing: path, home: home) {
+            throw ScannerError.protectedLocation(path: path, title: location.title)
+        }
+        if path.split(separator: "/").contains(where: { SystemPolicy.isProtectedPackage(name: String($0)) }) {
+            throw ScannerError.protectedLocation(path: path, title: (path as NSString).lastPathComponent)
+        }
+        guard path != "/" else { return }
+        // The user's own per-user temporary folder lives under /private but is theirs.
+        let userTemp = resolve(NSTemporaryDirectory())
+        if path == userTemp || path.hasPrefix(userTemp + "/") { return }
+        let allowedInsideSystem = ["/Library/Developer", "/usr/local", "/Volumes/"]
+        let isSystem = SystemPolicy.systemRoots.contains { path == $0 || path.hasPrefix($0 + "/") }
+        let isAllowed = allowedInsideSystem.contains { path == $0 || path.hasPrefix($0.hasSuffix("/") ? $0 : $0 + "/") }
+            && path != "/Volumes"
+        if isSystem && !isAllowed {
+            throw ScannerError.systemLocation(path: path)
+        }
     }
 
     /// realpath(3) with a sane fallback; strips trailing slashes.
@@ -206,10 +246,11 @@ final class ScanSession: @unchecked Sendable {
 
     func run() -> ScanResult {
         startedAt = Date()
+        if options.lowPriority { Self.engageGentleIO() }
         var st = stat()
         lstat(rootPath, &st)
         let rootDevice = st.st_dev
-        let wholeDisk = rootPath == "/"
+        if rootPath == "/" { return runWholeDisk(rootStat: st) }
 
         // lstat reports one device for the whole boot volume group (System +
         // Data + firmlinks), so firmlinks need no special casing here; other
@@ -230,21 +271,85 @@ final class ScanSession: @unchecked Sendable {
         )
         _ = guardrail.markVisited(device: rootDevice, inode: UInt64(st.st_ino))
 
-        // Phase 1.
         traverse(seed: [DirectoryWorkQueue.Job(node: root, path: rootPath)])
+        return finish(root)
+    }
 
-        // Phase 2 (whole disk): the Data volume, minus everything reached via firmlinks.
-        if wholeDisk, !options.crossMountPoints, !isCancelled,
-           let dataNode = root.descendant(atPath: TraversalGuard.dataVolumeMount),
-           dataNode.kind == .directory, dataNode.flags.contains(.mountPoint) {
-            var dst = stat()
-            if lstat(TraversalGuard.dataVolumeMount, &dst) == 0 {
-                _ = guardrail.markVisited(device: dst.st_dev, inode: UInt64(dst.st_ino))
+    /// Whole-disk ("Macintosh HD") composition. Only user areas are enumerated
+    /// (SystemPolicy.wholeDiskScanRoots); the sealed macOS volume, Preboot,
+    /// Recovery, VM, Update and everything KlaD never opens on the Data volume
+    /// (system-wide files, other users, protected app data, snapshot-held
+    /// blocks) become opaque nodes sized from APFS container accounting.
+    private func runWholeDisk(rootStat st: stat) -> ScanResult {
+        let home = NSHomeDirectory()
+        guardrail = TraversalGuard(crossMountPoints: false, excludedPaths: options.excludedPaths, allowedDevices: [st.st_dev], home: home)
+        let root = FileTreeNode(name: "/", kind: .directory, fileID: UInt64(st.st_ino), deviceID: st.st_dev,
+                                modificationTime: Int64(st.st_mtimespec.tv_sec))
+        var seeds: [DirectoryWorkQueue.Job] = []
+        for scanRoot in SystemPolicy.wholeDiskScanRoots(home: home) {
+            var rst = stat()
+            guard lstat(scanRoot, &rst) == 0, (rst.st_mode & S_IFMT) == S_IFDIR else { continue }
+            // Build (or reuse) intermediate nodes from the root down to the scan root.
+            var cursor = root
+            var cursorPath = ""
+            let components = scanRoot.split(separator: "/").map(String.init)
+            for (index, component) in components.enumerated() {
+                cursorPath += "/" + component
+                if let existing = cursor.child(named: component) {
+                    cursor = existing
+                    continue
+                }
+                var cst = stat()
+                lstat(cursorPath, &cst)
+                let node = FileTreeNode(
+                    name: component,
+                    kind: .directory,
+                    flags: Self.nodeFlags(bsdFlags: cst.st_flags, extFlags: 0, name: component, isDirectory: true),
+                    fileID: UInt64(cst.st_ino),
+                    deviceID: cst.st_dev,
+                    modificationTime: Int64(cst.st_mtimespec.tv_sec)
+                )
+                cursor.appendChild(node)
+                cursor = node
+                if index == components.count - 1 {
+                    _ = guardrail.markVisited(device: cst.st_dev, inode: UInt64(cst.st_ino))
+                    seeds.append(DirectoryWorkQueue.Job(node: node, path: scanRoot))
+                }
             }
-            dataNode.flags.remove(.excluded)
-            traverse(seed: [DirectoryWorkQueue.Job(node: dataNode, path: TraversalGuard.dataVolumeMount)])
         }
+        traverse(seed: seeds)
 
+        // APFS accounting for everything not enumerated.
+        if let volume = wholeDiskVolume {
+            let scannedUnique = uniqueAllocation.withLock { $0.bytes }
+            for usage in volume.containerVolumes {
+                let role = usage.roles.first ?? ""
+                let (title, reason): (String, String)
+                switch role {
+                case "Data":
+                    let hidden = usage.capacityInUse > scannedUnique ? usage.capacityInUse - scannedUnique : 0
+                    guard hidden > 0 else { continue }
+                    root.appendChild(.opaque("System Data & Protected", bytes: hidden, category: .system, annotation: NodeAnnotation(
+                        ruleID: "apfs.hidden", title: "System Data & Protected", safety: .doNotDelete, group: .system,
+                        reason: "Space on the Data volume KlaD deliberately doesn't open: system-wide files (/Library, /private), other users, macOS-protected app data (Mail, Messages, Photos, app containers), local-snapshot blocks and APFS metadata. Sized from APFS volume totals.")))
+                    continue
+                case "System": (title, reason) = ("macOS", "The sealed, read-only macOS system volume. Changed only by Software Update.")
+                case "Preboot": (title, reason) = ("Preboot", "Boot support and cryptexes (Safari, system frameworks) managed by macOS.")
+                case "Recovery": (title, reason) = ("Recovery", "The macOS Recovery system.")
+                case "VM": (title, reason) = ("Virtual Memory", "Swap and sleep image. Shrinks when apps quit or after a restart.")
+                case "Update": (title, reason) = ("Software Update", "Staged macOS updates, cleared automatically after updating.")
+                default: (title, reason) = (usage.name, "Another APFS volume in the same container.")
+                }
+                guard usage.capacityInUse > 0 else { continue }
+                root.appendChild(.opaque(title, bytes: usage.capacityInUse, category: .system, annotation: NodeAnnotation(
+                    ruleID: "apfs.volume." + (role.isEmpty ? "other" : role.lowercased()), title: title,
+                    safety: .doNotDelete, group: .system, reason: reason)))
+            }
+        }
+        return finish(root)
+    }
+
+    private func finish(_ root: FileTreeNode) -> ScanResult {
         let cancelled = isCancelled
         if cancelled {
             for job in queue.drainRemaining() {
@@ -283,7 +388,7 @@ final class ScanSession: @unchecked Sendable {
                 group.leave()
             }
             thread.name = "klad.scan.worker.\(index)"
-            thread.qualityOfService = .userInitiated
+            thread.qualityOfService = options.lowPriority ? .utility : .userInitiated
             thread.stackSize = 1 << 20
             thread.start()
         }
@@ -309,8 +414,14 @@ final class ScanSession: @unchecked Sendable {
 
     // MARK: Worker
 
+    /// IOPOL_TYPE_DISK / IOPOL_SCOPE_THREAD / IOPOL_THROTTLE for gentle rescans.
+    static func engageGentleIO() {
+        setiopolicy_np(0, 1, 3)
+    }
+
     private func workerLoop() {
         DatalessMaterializationGuard.engageForCurrentThread()
+        if options.lowPriority { Self.engageGentleIO() }
         var reader = BulkDirectoryReader(requestPrivateSize: options.requestPrivateSize)
         defer { reader.deallocate() }
         while let job = queue.next() {
@@ -330,6 +441,7 @@ final class ScanSession: @unchecked Sendable {
         var cloud: UInt64 = 0
         var hardLinkDuplicates = 0
         var sawPrivate = false
+        var uniqueBytes: UInt64 = 0
         let guardrail = self.guardrail!
 
         let result = reader.read(path: job.path, isCancelled: { self.isCancelled }) { entry in
@@ -359,7 +471,7 @@ final class ScanSession: @unchecked Sendable {
                     deviceID: identity.deviceID,
                     modificationTime: identity.modificationTime
                 )
-                switch guardrail.decide(entry: identity, childPath: childPath) {
+                switch guardrail.decide(entry: identity, childPath: childPath, name: name) {
                 case .descend:
                     newJobs.append(DirectoryWorkQueue.Job(node: node, path: childPath))
                 case .skip(let extra):
@@ -415,6 +527,12 @@ final class ScanSession: @unchecked Sendable {
             )
             files += 1
             if !duplicate {
+                let cloneID = entry.cloneID
+                if cloneID != 0 && flags.contains(.sharesAllBlocks) {
+                    if uniqueAllocation.withLock({ $0.clones.insert(cloneID).inserted }) { uniqueBytes &+= fileAllocated }
+                } else {
+                    uniqueBytes &+= fileAllocated
+                }
                 allocated &+= fileAllocated
                 logical &+= fileLogical
                 if isStub { cloud &+= fileLogical }
@@ -428,14 +546,23 @@ final class ScanSession: @unchecked Sendable {
         case .openFailed(let code), .readFailed(let code): failure = code
         case .cancelled: job.node.flags.insert(.incompleteSubtree)
         }
+        var protectedByOS = false
         if let failure {
-            job.node.flags.insert(.unreadable)
             job.node.errorCode = failure
+            if failure == EPERM || failure == EACCES {
+                // macOS privacy protection or another user's data: not an error —
+                // KlaD simply doesn't read it (no Full Disk Access needed).
+                job.node.flags.insert(.protectedLocation)
+                protectedByOS = true
+            } else {
+                job.node.flags.insert(.unreadable)
+            }
         }
         job.node.setChildren(children)
 
         let jobPath = job.path
-        stats.withLock { [files, directories, allocated, logical, cloud, hardLinkDuplicates, sawPrivate, failure] s in
+        if uniqueBytes > 0 { uniqueAllocation.withLock { [uniqueBytes] in $0.bytes &+= uniqueBytes } }
+        stats.withLock { [files, directories, allocated, logical, cloud, hardLinkDuplicates, sawPrivate, failure, protectedByOS] s in
             s.files &+= files
             s.directories &+= directories + 1
             s.allocated &+= allocated
@@ -444,7 +571,7 @@ final class ScanSession: @unchecked Sendable {
             s.hardLinkDuplicates += hardLinkDuplicates
             if sawPrivate { s.sawPrivateSize = true }
             s.lastPath = jobPath
-            if let failure {
+            if let failure, !protectedByOS {
                 s.unreadable &+= 1
                 if s.issues.count < Self.maxIssues {
                     s.issues.append(ScanIssue(path: jobPath, errorCode: failure, message: String(cString: strerror(failure))))

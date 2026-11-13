@@ -1,10 +1,11 @@
-// TreemapCanvasView.swift — squarified treemap with zoom transitions
+// TreemapCanvasView.swift — squarified treemap with zoom transitions.
 
 import SwiftUI
 import KlaDModels
 
 struct TreemapCanvasView: View {
     @Environment(AppState.self) private var app
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var geometry: TreemapGeometry?
     @State private var hovered: Int?
@@ -13,6 +14,7 @@ struct TreemapCanvasView: View {
     private struct Key: Equatable {
         let focus: ObjectIdentifier?
         let measure: SizeMeasure
+        let mode: ColorMode
         let version: Int
         let width: Int
         let height: Int
@@ -20,23 +22,15 @@ struct TreemapCanvasView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let key = Key(focus: app.focus.map(ObjectIdentifier.init), measure: app.measure, version: app.treeVersion,
-                          width: Int(proxy.size.width), height: Int(proxy.size.height))
+            let key = Key(focus: app.focus.map(ObjectIdentifier.init), measure: app.measure, mode: app.colorMode,
+                          version: app.treeVersion, width: Int(proxy.size.width), height: Int(proxy.size.height))
             ZStack(alignment: .topLeading) {
                 if let geometry {
                     TreemapBaseLayer(geometry: geometry, transition: transition)
                         .equatable()
-                    TreemapOverlayLayer(
-                        geometry: geometry,
-                        hovered: hovered,
-                        selected: app.selection.flatMap { geometry.index(of: $0) }
-                    )
-                    .allowsHitTesting(false)
-                    if let hovered, hovered < geometry.tiles.count {
-                        HoverCard(tile: geometry.tiles[hovered], total: geometry.total)
-                            .padding(10)
-                            .allowsHitTesting(false)
-                    }
+                    TreemapOverlayLayer(geometry: geometry, hovered: hovered,
+                                        selected: app.selection.flatMap { geometry.index(of: $0) })
+                        .allowsHitTesting(false)
                 }
             }
             .contentShape(Rectangle())
@@ -49,15 +43,26 @@ struct TreemapCanvasView: View {
                     hovered = nil
                 }
             }
+            .help(helpText)
             .onTapGesture(count: 2, coordinateSpace: .local) { _ in app.drillUp() }
             .onTapGesture(coordinateSpace: .local) { point in handleTap(point) }
             .contextMenu { contextMenu }
-            .onAppear { rebuild(key: key, size: proxy.size, animated: false) }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Treemap of \(app.focus?.displayName ?? "")")
+            .onAppear { rebuild(size: proxy.size, animated: false) }
             .onChange(of: key) { old, new in
-                let resizedOnly = old.focus == new.focus && old.measure == new.measure && old.version == new.version
-                rebuild(key: new, size: proxy.size, animated: !resizedOnly)
+                let resizedOnly = old.focus == new.focus && old.measure == new.measure && old.version == new.version && old.mode == new.mode
+                rebuild(size: proxy.size, animated: !resizedOnly && !reduceMotion)
             }
         }
+    }
+
+    private var helpText: String {
+        guard let geometry, let hovered, hovered < geometry.tiles.count else { return "" }
+        let tile = geometry.tiles[hovered]
+        let name = tile.node?.name ?? "\(tile.aggregateCount) smaller items"
+        let share = (Double(tile.value) / Double(max(geometry.total, 1))).formatted(.percent.precision(.fractionLength(1)))
+        return "\(name) — \(formatBytes(tile.value)) (\(share))"
     }
 
     private func handleTap(_ point: CGPoint) {
@@ -73,15 +78,7 @@ struct TreemapCanvasView: View {
     @ViewBuilder
     private var contextMenu: some View {
         if let geometry, let hovered, hovered < geometry.tiles.count, let node = geometry.tiles[hovered].node {
-            Button("Reveal in Finder") { SystemActions.reveal(node.path) }
-            Button("Copy Path") { SystemActions.copy(node.path) }
-            if node.isDirectory && node.hasChildren {
-                Button("Zoom Into \(node.name)") { app.drill(into: node) }
-            }
-            if app.canTrash(node) {
-                Divider()
-                Button("Move to Trash…") { app.requestCleanup(node: node) }
-            }
+            NodeContextMenu(node: node)
         }
         if app.focus?.parent != nil {
             Divider()
@@ -89,21 +86,19 @@ struct TreemapCanvasView: View {
         }
     }
 
-    private func rebuild(key: Key, size: CGSize, animated: Bool) {
+    private func rebuild(size: CGSize, animated: Bool) {
         guard let focus = app.focus, size.width > 8, size.height > 8 else {
             geometry = nil
             return
         }
         let old = geometry
-        let new = TreemapGeometry(focus: focus, measure: app.measure, size: size)
+        let new = TreemapGeometry(focus: focus, measure: app.measure, size: size, colorMode: app.colorMode)
         var from = CGAffineTransform.identity
         let bounds = CGRect(origin: .zero, size: size)
         if animated, let old, old.focus !== focus, old.measure == new.measure {
             if let index = old.index(of: focus) {
-                // Drill down: the full-size layout starts inside the tile it came from.
                 from = Self.transform(mapping: bounds, to: old.tiles[index].rect)
             } else if let index = new.index(of: old.focus) {
-                // Drill up: start zoomed into where the old focus now sits.
                 from = Self.transform(mapping: new.tiles[index].rect, to: bounds)
             }
         }
@@ -122,17 +117,14 @@ struct TreemapCanvasView: View {
     }
 }
 
-/// Equatable wrapper for CGAffineTransform interpolation.
 struct AffineBox: Equatable, Sendable {
     var t: CGAffineTransform
     init(_ t: CGAffineTransform) { self.t = t }
 
     func interpolated(_ p: Double) -> CGAffineTransform {
         let q = CGFloat(p)
-        return CGAffineTransform(
-            a: t.a + (1 - t.a) * q, b: t.b * (1 - q), c: t.c * (1 - q), d: t.d + (1 - t.d) * q,
-            tx: t.tx * (1 - q), ty: t.ty * (1 - q)
-        )
+        return CGAffineTransform(a: t.a + (1 - t.a) * q, b: t.b * (1 - q), c: t.c * (1 - q), d: t.d + (1 - t.d) * q,
+                                 tx: t.tx * (1 - q), ty: t.ty * (1 - q))
     }
 }
 
@@ -164,46 +156,15 @@ private struct TreemapOverlayLayer: View {
         Canvas { context, _ in
             if let hovered, hovered < geometry.tiles.count {
                 let rect = geometry.tiles[hovered].rect
-                let path = Path(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), cornerRadius: 3)
-                context.fill(path, with: .color(Color.white.opacity(0.14)))
-                context.stroke(path, with: .color(Color.white.opacity(0.9)), lineWidth: 1.5)
-                var parent = geometry.tiles[hovered].parent
-                while parent >= 0 {
-                    let r = geometry.tiles[parent].rect
-                    context.stroke(Path(roundedRect: r.insetBy(dx: 0.5, dy: 0.5), cornerRadius: 3),
-                                   with: .color(Color.white.opacity(0.35)), lineWidth: 1)
-                    parent = geometry.tiles[parent].parent
-                }
+                let path = Path(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), cornerRadius: 4, style: .continuous)
+                context.fill(path, with: .color(Color.primary.opacity(0.12)))
+                context.stroke(path, with: .color(Color.primary.opacity(0.8)), lineWidth: 1.5)
             }
             if let selected, selected < geometry.tiles.count {
                 let rect = geometry.tiles[selected].rect
-                context.stroke(Path(roundedRect: rect.insetBy(dx: 1, dy: 1), cornerRadius: 3),
-                               with: .color(Theme.accent), lineWidth: 2)
+                context.stroke(Path(roundedRect: rect.insetBy(dx: 1, dy: 1), cornerRadius: 4, style: .continuous),
+                               with: .color(.accentColor), lineWidth: 2.5)
             }
         }
-    }
-}
-
-private struct HoverCard: View {
-    let tile: TreemapTile
-    let total: UInt64
-
-    var body: some View {
-        HStack(spacing: 8) {
-            if let node = tile.node { CategoryDot(category: node.category) }
-            VStack(alignment: .leading, spacing: 1) {
-                Text(tile.node?.name ?? "\(tile.aggregateCount) smaller items")
-                    .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(Theme.textPrimary)
-                    .lineLimit(1)
-                Text("\(formatBytes(tile.value)) · \(String(format: "%.1f%%", Double(tile.value) / Double(max(total, 1)) * 100))")
-                    .font(.system(size: 10.5, weight: .medium))
-                    .monospacedDigit()
-                    .foregroundStyle(Theme.textSecondary)
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .glassPanel(radius: 8, fill: Theme.panelRaised)
     }
 }

@@ -12,16 +12,19 @@ import KlaDModels
 public final class SafeCleanupService: SafeCleanupPerforming {
     private let runningApplicationBundleIDs: (@Sendable () async -> Set<String>)?
     private let trashItem: @Sendable (URL) throws -> URL?
+    private let homeDirectory: String
 
     /// Wall-clock budget for the open-file scan.
     static let openFileBudget: TimeInterval = 0.5
 
     public init(
         runningApplicationBundleIDs: (@Sendable () async -> Set<String>)? = nil,
-        trashItem: (@Sendable (URL) throws -> URL?)? = nil
+        trashItem: (@Sendable (URL) throws -> URL?)? = nil,
+        homeDirectory: String = NSHomeDirectory()
     ) {
         self.runningApplicationBundleIDs = runningApplicationBundleIDs
         self.trashItem = trashItem ?? Self.defaultTrashItem
+        self.homeDirectory = SystemPolicy.normalize(homeDirectory)
     }
 
     private static let defaultTrashItem: @Sendable (URL) throws -> URL? = { url in
@@ -70,13 +73,16 @@ public final class SafeCleanupService: SafeCleanupPerforming {
                                          detail: "Safety tier “\(target.safety.displayName)” never permits Trash."))
         }
 
-        // 4. protected path
-        checks.append(Self.protectedPathCheck(for: target.path, exists: existsErrno == nil))
+        // 4. systemPolicy
+        checks.append(Self.systemPolicyCheck(for: target.path, home: homeDirectory, exists: existsErrno == nil))
 
-        // 5. running apps
+        // 5. ownership
+        checks.append(Self.ownershipCheck(stat: existsErrno == nil ? st : nil))
+
+        // 6. running apps
         checks.append(await runningAppsCheck(for: target))
 
-        // 6. open files
+        // 7. open files
         var usage: [ProcessUsage] = []
         if existsErrno != nil {
             checks.append(PreflightCheck(id: "openFiles", title: "No open files inside", status: .skipped,
@@ -99,7 +105,112 @@ public final class SafeCleanupService: SafeCleanupPerforming {
             }
         }
 
+        // 8. cloudSynced
+        checks.append(cloudSyncedCheck(for: target.path))
+
+        // 9. largeDelete
+        checks.append(Self.largeDeleteCheck(for: target.metrics))
+
         return PreflightReport(target: target, checks: checks, processesUsingTarget: usage, checkedAt: Date())
+    }
+
+    // MARK: - Cloud / size warnings
+
+    private func cloudSyncedCheck(for path: String) -> PreflightCheck {
+        let title = "Not synced with iCloud"
+        var synced = SystemPolicy.isCloudSynced(path, home: homeDirectory)
+        if !synced, let real = Self.resolvedPath(path), let realHome = Self.resolvedPath(homeDirectory) {
+            synced = SystemPolicy.isCloudSynced(real, home: realHome)
+        }
+        if synced {
+            return PreflightCheck(id: "cloudSynced", title: title, status: .warning,
+                                  detail: "Deleting here also deletes it from iCloud on all your devices.",
+                                  requiresAcknowledgement: true)
+        }
+        return PreflightCheck(id: "cloudSynced", title: title, status: .passed, detail: "Not in an iCloud or File Provider folder.")
+    }
+
+    static func largeDeleteCheck(for metrics: StorageMetrics) -> PreflightCheck {
+        let title = "Size of this delete"
+        if metrics.allocatedBytes >= SystemPolicy.largeDeleteBytes || metrics.itemCount >= SystemPolicy.largeDeleteItems {
+            let size = ByteCountFormatter.string(fromByteCount: Int64(clamping: metrics.allocatedBytes), countStyle: .file)
+            return PreflightCheck(id: "largeDelete", title: title, status: .warning,
+                                  detail: "This is a large delete: \(size) in \(metrics.itemCount) items. Confirm it is what you intend.",
+                                  requiresAcknowledgement: true)
+        }
+        return PreflightCheck(id: "largeDelete", title: title, status: .passed, detail: "Not an unusually large delete.")
+    }
+
+    // MARK: - System policy / ownership
+
+    /// Resolves symlinks in an existing path (nil when it does not exist).
+    static func resolvedPath(_ path: String) -> String? {
+        guard let real = realpath(path, nil) else { return nil }
+        defer { free(real) }
+        return String(cString: real)
+    }
+
+    /// A reason `path` must never be touched, or nil when the system policy permits it.
+    /// Additive: SystemPolicy.mayModify, the protected-path / mount-point rules, and
+    /// "no symlinked path component below home that resolves outside what the policy permits".
+    static func systemPolicyFailure(path: String, home: String, exists: Bool) -> String? {
+        let homePath = SystemPolicy.normalize(home)
+        guard SystemPolicy.mayModify(path, home: homePath) else {
+            return "Only items inside your home folder, outside protected data, can be moved to the Trash."
+        }
+        if let reason = protectedReason(for: path, exists: exists, extraHomes: [homePath]) { return reason }
+        guard exists else { return nil }
+
+        let realHome = resolvedPath(homePath) ?? homePath
+        let normalized = SystemPolicy.normalize(path)
+        var current = homePath
+        for component in normalized.dropFirst(homePath.count + 1).split(separator: "/", omittingEmptySubsequences: true) {
+            current += "/" + component
+            var st = stat()
+            guard lstat(current, &st) == 0 else { break }
+            guard (st.st_mode & S_IFMT) == S_IFLNK else { continue }
+            guard let real = resolvedPath(current), SystemPolicy.mayModify(real, home: realHome) else {
+                return "“\(current)” is a symbolic link that leads outside the area KlaD may modify."
+            }
+        }
+        // Whatever the kernel would actually act on must be permitted too.
+        let url = URL(fileURLWithPath: normalized)
+        if let parent = resolvedPath(url.deletingLastPathComponent().path) {
+            let real = (parent == "/" ? "" : parent) + "/" + url.lastPathComponent
+            if !SystemPolicy.mayModify(real, home: realHome) {
+                return "The resolved location is outside the area KlaD may modify."
+            }
+        }
+        return nil
+    }
+
+    static func systemPolicyCheck(for path: String, home: String, exists: Bool) -> PreflightCheck {
+        let title = "Inside your home folder, outside protected data"
+        if let reason = systemPolicyFailure(path: path, home: home, exists: exists) {
+            return PreflightCheck(id: "systemPolicy", title: title, status: .failed, detail: reason)
+        }
+        return PreflightCheck(id: "systemPolicy", title: title, status: .passed,
+                              detail: "Inside your home folder and not protected by macOS or KlaD.")
+    }
+
+    /// SF_RESTRICTED | SF_IMMUTABLE | UF_IMMUTABLE | SF_NOUNLINK | SF_FIRMLINK
+    private static let lockedFlagMask: UInt32 = 0x80000 | 0x20000 | 0x2 | 0x100000 | 0x800000
+
+    static func ownershipFailure(stat st: stat) -> String? {
+        if st.st_uid != getuid() { return "This item is not owned by you." }
+        if st.st_flags & lockedFlagMask != 0 { return "This item is locked by the system (immutable or restricted)." }
+        return nil
+    }
+
+    static func ownershipCheck(stat st: stat?) -> PreflightCheck {
+        let title = "Owned by you, not locked by the system"
+        guard let st else {
+            return PreflightCheck(id: "ownership", title: title, status: .failed, detail: "Cannot verify ownership: item is missing.")
+        }
+        if let reason = ownershipFailure(stat: st) {
+            return PreflightCheck(id: "ownership", title: title, status: .failed, detail: reason)
+        }
+        return PreflightCheck(id: "ownership", title: title, status: .passed, detail: "Owned by you and not locked.")
     }
 
     private func runningAppsCheck(for target: CleanupTarget) async -> PreflightCheck {
@@ -127,15 +238,6 @@ public final class SafeCleanupService: SafeCleanupPerforming {
 
     // MARK: - Protected paths
 
-    static func protectedPathCheck(for path: String, exists: Bool) -> PreflightCheck {
-        let title = "Not a protected location"
-        if let reason = protectedReason(for: path, exists: exists) {
-            return PreflightCheck(id: "protectedPath", title: title, status: .failed, detail: reason)
-        }
-        return PreflightCheck(id: "protectedPath", title: title, status: .passed,
-                              detail: "Not a system, home or volume root location.")
-    }
-
     private static let protectedTopLevel: Set<String> = [
         "/", "/System", "/Users", "/Applications", "/Library", "/private", "/usr", "/bin", "/sbin",
         "/Volumes", "/etc", "/var", "/opt", "/cores", "/dev", "/tmp", "/private/var", "/private/etc", "/private/tmp",
@@ -157,7 +259,7 @@ public final class SafeCleanupService: SafeCleanupPerforming {
     }
 
     /// Returns a human-readable reason when `path` must never be trashed, else nil.
-    static func protectedReason(for rawPath: String, exists: Bool) -> String? {
+    static func protectedReason(for rawPath: String, exists: Bool, extraHomes: [String] = []) -> String? {
         let lexical = normalize(rawPath)
         var candidates = [lexical]
         var isSymlink = false
@@ -178,6 +280,7 @@ public final class SafeCleanupService: SafeCleanupPerforming {
         var homes = Set([normalize(NSHomeDirectory())])
         if let home = realHome() { homes.insert(normalize(home)) }
         homes.insert(normalize(FileManager.default.homeDirectoryForCurrentUser.path))
+        for extra in extraHomes { homes.insert(normalize(extra)) }
 
         for path in Set(candidates) {
             if protectedTopLevel.contains(path) { return "“\(path)” is a protected system location." }
@@ -332,11 +435,13 @@ public final class SafeCleanupService: SafeCleanupPerforming {
             return refuse("Safety tier “\(target.safety.displayName)” does not permit moving to Trash.")
         }
         // Independent of the (caller-supplied) report: never trash a protected location.
-        if let reason = Self.protectedReason(for: target.path, exists: true) { return refuse(reason) }
+        if let reason = Self.protectedReason(for: target.path, exists: true, extraHomes: [homeDirectory]) { return refuse(reason) }
+        if let reason = Self.systemPolicyFailure(path: target.path, home: homeDirectory, exists: true) { return refuse(reason) }
 
         // TOCTOU guard: re-verify identity immediately before the move.
         var st = stat()
         guard lstat(target.path, &st) == 0 else { return refuse("The item no longer exists.") }
+        if let reason = Self.ownershipFailure(stat: st) { return refuse(reason) }
         guard UInt64(st.st_ino) == target.identity.fileID, st.st_dev == target.identity.deviceID else {
             return refuse("The item was replaced after pre-flight; refusing to move it.")
         }

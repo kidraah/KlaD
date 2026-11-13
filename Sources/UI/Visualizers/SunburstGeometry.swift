@@ -75,6 +75,7 @@ final class SunburstGeometry: @unchecked Sendable {
     let identity = UUID()
 
     init(focus: FileTreeNode, measure: SizeMeasure,
+         colorMode: ColorMode = .category,
          maxRings: Int = SunburstGeometry.defaultMaxRings,
          minAngle: Double = SunburstGeometry.defaultMinAngle) {
         self.focus = focus
@@ -124,7 +125,7 @@ final class SunburstGeometry: @unchecked Sendable {
                         ring: ring,
                         start: a0,
                         end: a1,
-                        color: VisualizerPalette.color(for: child, depth: ring, siblingIndex: sibling),
+                        color: VisualizerPalette.color(for: child, depth: ring, siblingIndex: sibling, mode: colorMode),
                         value: v,
                         aggregateCount: 0,
                         parent: item.index,
@@ -258,8 +259,8 @@ final class SunburstGeometry: @unchecked Sendable {
             }
             if segment.hasHiddenChildren && e - s > 0.02 && transform == .identity {
                 // Outer tick: "more inside".
-                let tick = Self.sectorPath(center: m.center, inner: outer - 2, outer: outer + 1.5, start: s + 0.004, end: e - 0.004)
-                context.fill(tick, with: .color(Color.white.opacity(0.22)))
+                let tick = Self.sectorPath(center: m.center, inner: outer + 1.5, outer: outer + 3.5, start: s + 0.004, end: e - 0.004)
+                context.fill(tick, with: .color(Color(nsColor: .tertiaryLabelColor)))
             }
         }
     }

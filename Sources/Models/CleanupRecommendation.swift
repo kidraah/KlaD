@@ -26,6 +26,8 @@ public enum RecommendationGroup: String, Sendable, CaseIterable, Codable, Hashab
     case duplicates
     /// ~/Library/Application Support and similar app-owned data (inspect only).
     case appData
+    /// Data left behind by apps that are no longer installed (review first, hints only).
+    case appLeftovers
     /// OS-owned locations.
     case system
 
@@ -42,6 +44,7 @@ public enum RecommendationGroup: String, Sendable, CaseIterable, Codable, Hashab
         case .snapshots: return "Local Snapshots"
         case .duplicates: return "Duplicate Files"
         case .appData: return "Application Data"
+        case .appLeftovers: return "Leftovers of Removed Apps"
         case .system: return "System"
         }
     }
@@ -57,6 +60,7 @@ public enum RecommendationGroup: String, Sendable, CaseIterable, Codable, Hashab
         case .snapshots: return "clock.arrow.circlepath"
         case .duplicates: return "doc.on.doc.fill"
         case .appData: return "app.dashed"
+        case .appLeftovers: return "trash.square"
         case .system: return "lock.shield.fill"
         }
     }

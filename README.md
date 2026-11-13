@@ -1,76 +1,77 @@
 # KlaD
 
-**APFS storage intelligence, developer purge & visual disk analyzer.** Free and open source. macOS 14+, Swift 6.
+**Kernel Block & Logical Allocation Debugger** — a free, open-source storage analyzer for macOS
+that tells you where your SSD went, with sizes that are actually true on APFS.
 
-KlaD answers *"where did my SSD go?"* with numbers that are actually true on APFS — and only ever
-recommends deleting things it can **prove** are regeneratable.
+It looks and behaves like an app that came with your Mac: native sidebar, toolbar, search,
+inspector and Settings, system colors, and it follows Light/Dark mode and your accent color.
 
-## Why another disk analyzer?
+## Three promises
 
-On APFS a single "size" lies:
+1. **No Full Disk Access, ever.** KlaD works fully without it.
+2. **Protected and system data is never touched.** Mail, Messages, Safari, browser profiles,
+   other apps' containers, iOS backups, the Photos library, the sealed macOS volume and system
+   folders are never opened — not even listed — whether or not access was granted. Their space is
+   accounted for from APFS's own volume totals, the same numbers System Settings › Storage uses.
+3. **Nothing is deleted without proof and your OK.** KlaD can only move items *inside your home
+   folder* to the Trash, only when a rule proves they're regeneratable (or you confirm a review),
+   after re-checking identity, ownership, system flags, open files and running apps. iCloud-synced
+   items and very large deletes need an extra tick. All rules live in one file:
+   [`Sources/Models/SystemPolicy.swift`](Sources/Models/SystemPolicy.swift).
+
+## Why APFS needs a different kind of size
 
 | Metric | Source | Meaning |
 |---|---|---|
-| **Logical** | `ATTR_FILE_TOTALSIZE` | What the file says it contains (sparse VM disks: 1 TB). |
-| **Allocated** | `ATTR_FILE_ALLOCSIZE` | Physical blocks on the SSD. |
-| **Reclaimable** | `ATTR_CMNEXT_PRIVATESIZE` | Blocks **not** shared with an APFS clone, snapshot or hard link — what deleting frees *immediately*. |
-| **iCloud** | `SF_DATALESS` | Placeholders: logical size in iCloud, 0 B on disk. **Never opened, read or hashed.** |
+| Logical | `ATTR_FILE_TOTALSIZE` | What the file says it holds (a sparse VM disk can claim 1 TB). |
+| Size on disk | `ATTR_FILE_ALLOCSIZE` | Physical blocks allocated. |
+| Freed if deleted | `ATTR_CMNEXT_PRIVATESIZE` | Blocks not shared with APFS clones, snapshots or hard links. |
+| In iCloud only | `SF_DATALESS` | Placeholders: 0 B on disk. Never opened or downloaded (enforced by the kernel I/O policy). |
 
-Example from a real scan: a `uv` cache shows *2.87 GB reclaimable of 4.48 GB allocated* — uv clones
-files, so a naive cleaner would over-promise by 1.6 GB.
+Real example: a `uv` cache of 4.48 GB frees only 2.87 GB, because uv clones its files.
 
-## Features
+## What it does
 
-- **Bulk BSD scanner** — `getattrlistbulk(2)` on a dedicated thread pool: ~140 k items/s
-  (2.5 M items of a home folder in ~20 s), byte-exact against `du`. Firmlink/volume-group aware,
-  never crosses mount points or autofs triggers, counts hard links once, and engages
-  `IOPOL_MATERIALIZE_DATALESS_FILES_OFF` so the kernel itself refuses to download iCloud files.
-- **Explore** — LoD-culled **Sunburst** (5 rings, arcs < 0.46° merged) and squarified **Treemap**
-  (tiles < 6 × 6 pt merged) on `Canvas`, cached geometry, O(log n) hover hit-testing, animated
-  polar / affine zoom; synced tree-table and an APFS telemetry inspector.
-- **Save Space** — evidence-first safety tiers:
-  - *Safe · Regeneratable* only with positive proof (`node_modules` + `package.json` + lockfile,
-    `target/` + `Cargo.toml`, `.venv` + `pyvenv.cfg` + pinned spec, DerivedData, package caches…);
-  - *Review First* for model weights, archives, generic `build/`;
-  - *Managed by Tool* for Docker/OrbStack/VM disks and local snapshots — KlaD shows the right
-    command (`docker system df`, `tmutil thinlocalsnapshots`…) and **never** trashes the file.
-  Git state and inactivity are shown as badges, never as proof. Duplicate finder: size → edge hash →
-  SHA-256, skipping placeholders and treating APFS clones as one copy.
-- **Pre-flight before every deletion** — identity (inode/device) re-check, protected-path guard,
-  open-file scan via libproc (500 ms budget), related-app check; deletion is **only**
-  `FileManager.trashItem` — never `removeItem`.
-- **History** — every scan is stored as a compact SQLite snapshot; *"Where did my space go?"* diffs
-  surface the deepest folders that actually grew. FSEvents marks changed subtrees dirty and rescans
-  them in the background.
-- **Volume truth** — Used vs *Purgeable* vs *Free now*, plus the APFS container breakdown
-  (Preboot, VM, Recovery, Update volumes — the usual "System Data" suspects).
+- **Overview** — sunburst or treemap (colour by category or by age), Finder-style table and path bar.
+  `getattrlistbulk(2)` scanning at ~160 000 items/s; a 2.5 M-item home folder in ~15 s, byte-exact vs `du`.
+- **Macintosh HD** — your user areas scanned; macOS, Preboot, Recovery, VM, Software Update and
+  "System Data & Protected" sized by APFS, so the whole disk adds up without opening system data.
+- **Recommendations** — Safe to Clear (node_modules + lockfile, Rust `target/`, `.venv`, DerivedData,
+  package caches…), Review First (models, archives, leftovers of removed apps), and guided commands for
+  Docker, VMs and snapshots. *Review All…* clears every safe item in one pass, skipping anything that
+  needs your individual attention.
+- **Largest Files**, **File Types**, **Similar Folders** (`project`, `project copy`, `project_v2`),
+  **Duplicates** (keeps the original-looking copy; APFS clones aren't counted as waste).
+- **Where Is My Space** — capacity vs what was counted, what APFS accounts for, and every protected
+  location with how to manage it in its own app.
+- **History** — every scan saved; used space over time with an honest fill forecast (a range, never a
+  date), what changed between scans, and a size chart per folder.
+- **Instant reopen + live updates** — the last scan reopens from a compact cache, then FSEvents replays
+  everything that changed while KlaD was closed and rescans just those folders, gently.
+
+Ideas adapted (and others deliberately left out) from the Windows analyzer
+[jayd108/Xylem](https://github.com/jayd108/Xylem).
 
 ## Build
 
-Command Line Tools are enough (no Xcode required).
+Command Line Tools are enough — no Xcode needed.
 
 ```sh
 make app          # release build → build/KlaD.app (ad-hoc signed, inside-out, no --deep)
 make run          # build + open
-make scan-home    # build + open + scan ~
-make test         # 115 Swift Testing tests (wraps CLT test-framework paths)
+make test         # 232 Swift Testing tests
 make probe        # headless scanner: .build/release/klad-probe scan ~ | verify <dir> | volume /
 ```
-
-For complete results grant **Full Disk Access** (System Settings → Privacy & Security). Ad-hoc
-signatures change on every rebuild, which resets privacy grants — sign with a stable identity:
-`make app SIGN_ID="Apple Development: …"`.
 
 ## Layout
 
 ```
-Sources/Models/      frozen data contracts + service protocols
-Sources/Scanner/     getattrlistbulk engine, firmlink/mount guard, volume inspector
-Sources/Services/    Intelligence (rules, classification, git) · StorageOps (SQLite history,
-                     duplicates, safe cleanup, FSEvents)
-Sources/UI/, App/    SwiftUI shell, Canvas visualizers, AppState
-Sources/Probe/       klad-probe CLI
-Tests/KlaDTests/    Core · Intelligence · StorageOps
+Sources/Models/      contracts, SystemPolicy (what may be read / modified)
+Sources/Scanner/     getattrlistbulk engine, firmlink/mount guard, APFS volume accounting
+Sources/Services/    Intelligence (rules, classification, git, insights) ·
+                     StorageOps (history, forecast, scan cache, duplicates, safe cleanup, FSEvents)
+Sources/UI/, App/    native SwiftUI app
+Tests/KlaDTests/     Core · Intelligence · StorageOps
 ```
 
-
+MIT License.

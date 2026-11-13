@@ -25,8 +25,8 @@ public enum SnapshotHistoryError: Error, Sendable, CustomStringConvertible, Loca
 
 // MARK: - Service
 
-public actor SnapshotHistoryService: SnapshotHistoryStoring {
-    private static let schemaVersion: Int32 = 1
+public actor SnapshotHistoryService: SnapshotHistoryStoring, SnapshotSeriesProviding {
+    private static let schemaVersion: Int32 = 2
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
     /// Owns the connection so the (nonisolated) deinit can close it.
@@ -40,7 +40,7 @@ public actor SnapshotHistoryService: SnapshotHistoryStoring {
     private var db: OpaquePointer { connection.pointer }
 
     /// Opens (creating if needed) the database at `databaseURL`, including its
-    /// parent directory and the v1 schema.
+    /// parent directory and the current schema (v1 databases are upgraded in place).
     public init(databaseURL: URL) throws {
         try FileManager.default.createDirectory(
             at: databaseURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -97,6 +97,8 @@ public actor SnapshotHistoryService: SnapshotHistoryStoring {
           seq INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY(snapshot_id, path)) WITHOUT ROWID;
         """)
+        // v2: per-path history lookups (sizeSeries).
+        try exec(db, "CREATE INDEX IF NOT EXISTS entries_path ON entries(path)")
         if version < schemaVersion {
             try exec(db, "PRAGMA user_version=\(schemaVersion)")
         }
@@ -179,6 +181,45 @@ public actor SnapshotHistoryService: SnapshotHistoryStoring {
             try? exec(db, "ROLLBACK")
             throw error
         }
+    }
+
+    // MARK: SnapshotSeriesProviding
+
+    public func sizeSeries(path: String) async throws -> [SizeSample] {
+        let stmt = try Statement(db, """
+        SELECT s.completed_at, e.logical, e.allocated, e.private, e.cloud, e.file_count, e.dir_count
+        FROM entries e JOIN snapshots s ON s.id = e.snapshot_id
+        WHERE e.path = ?1
+        ORDER BY s.completed_at ASC, s.started_at ASC, s.id
+        """)
+        try stmt.bind(text: path, at: 1)
+        var samples: [SizeSample] = []
+        while try stmt.step() {
+            samples.append(SizeSample(date: Date(timeIntervalSince1970: stmt.double(at: 0)),
+                                      metrics: Self.readMetrics(stmt, first: 1)))
+        }
+        return samples
+    }
+
+    public func usageSeries() async throws -> [UsageSample] {
+        let stmt = try Statement(db, """
+        SELECT completed_at, volume_json FROM snapshots
+        WHERE volume_json IS NOT NULL
+        ORDER BY completed_at ASC, started_at ASC, id
+        """)
+        let decoder = JSONDecoder()
+        var samples: [UsageSample] = []
+        while try stmt.step() {
+            guard let data = stmt.blob(at: 1), let volume = try? decoder.decode(VolumeSpaceReport.self, from: data) else { continue }
+            let total = volume.totalCapacity
+            let sample = UsageSample(
+                date: Date(timeIntervalSince1970: stmt.double(at: 0)),
+                usedBytes: total > volume.availableCapacity ? total - volume.availableCapacity : 0,
+                totalBytes: total)
+            // One sample per timestamp: a later snapshot of the same instant wins.
+            if let last = samples.last, last.date == sample.date { samples[samples.count - 1] = sample } else { samples.append(sample) }
+        }
+        return samples
     }
 
     // MARK: Writing

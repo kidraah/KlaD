@@ -40,6 +40,8 @@ final class TraversalGuard: @unchecked Sendable {
 
     let crossMountPoints: Bool
     let excludedPaths: Set<String>
+    /// SystemPolicy protected locations — never opened, unconditionally.
+    let neverEnter: Set<String>
     /// Devices whose directories may be entered without a mount point
     /// (root device, plus the Data volume in whole-disk mode).
     let allowedDevices: Set<Int32>
@@ -47,10 +49,11 @@ final class TraversalGuard: @unchecked Sendable {
     private let visitedLock = OSAllocatedUnfairLock(initialState: Set<InodeKey>())
     private let hardLinkLock = OSAllocatedUnfairLock(initialState: Set<InodeKey>())
 
-    init(crossMountPoints: Bool, excludedPaths: Set<String>, allowedDevices: Set<Int32>) {
+    init(crossMountPoints: Bool, excludedPaths: Set<String>, allowedDevices: Set<Int32>, home: String = NSHomeDirectory()) {
         self.crossMountPoints = crossMountPoints
         self.excludedPaths = excludedPaths
         self.allowedDevices = allowedDevices
+        self.neverEnter = SystemPolicy.neverEnterPaths(home: home)
     }
 
     /// Records a directory as visited. Returns false if it was already seen.
@@ -69,7 +72,11 @@ final class TraversalGuard: @unchecked Sendable {
     var hardLinkCount: Int { hardLinkLock.withLock { $0.count } }
 
     /// Whether to descend into a directory entry.
-    func decide(entry: BulkEntry, childPath: String) -> Decision {
+    func decide(entry: BulkEntry, childPath: String, name: String) -> Decision {
+        // Privacy-protected data: never opened, even with Full Disk Access.
+        if neverEnter.contains(childPath) || SystemPolicy.isProtectedPackage(name: name) {
+            return .skip([.protectedLocation, .excluded])
+        }
         if entry.bsdFlags & BSDFileFlags.sfDataless != 0 {
             return .skip([.cloudPlaceholder, .excluded])
         }

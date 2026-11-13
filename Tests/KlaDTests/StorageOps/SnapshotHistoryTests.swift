@@ -260,4 +260,154 @@ struct SnapshotHistoryTests {
         #expect(loaded.entries.count == 25_000)
         #expect(loaded.entries == entries)
     }
+
+    // MARK: Series (sizeSeries / usageSeries)
+
+    private func volume(total: UInt64, available: UInt64) -> VolumeSpaceReport {
+        VolumeSpaceReport(volumePath: "/", volumeName: "Macintosh HD", fileSystemType: "apfs", deviceIdentifier: "disk3s1",
+                          totalCapacity: total, availableCapacity: available, availableForImportantUsage: available,
+                          availableForOpportunisticUsage: available)
+    }
+
+    @Test func sizeSeriesIsOldestFirstAndSkipsSnapshotsWithoutThePath() async throws {
+        let scratch = try ScratchDir("hist"); defer { scratch.cleanup() }
+        let service = try makeService(scratch)
+        // Saved out of chronological order on purpose.
+        try await service.save(snapshot(completed: 300, entries: [entry("/r", 0, 9 * GB), entry("/r/cache", 1, 3 * GB)]))
+        try await service.save(snapshot(completed: 100, entries: [entry("/r", 0, 5 * GB), entry("/r/cache", 1, GB)]))
+        try await service.save(snapshot(completed: 200, entries: [entry("/r", 0, 7 * GB)]))   // no /r/cache that day
+        try await service.save(snapshot(root: "/other", completed: 250, entries: [entry("/other", 0, GB), entry("/r/cache", 1, 2 * GB)]))
+
+        let series = try await service.sizeSeries(path: "/r/cache")
+        #expect(series.map(\.date.timeIntervalSince1970) == [100, 250, 300])
+        #expect(series.map(\.metrics.allocatedBytes) == [GB, 2 * GB, 3 * GB])
+        #expect(series[0].metrics == metrics(GB))
+        #expect(try await service.sizeSeries(path: "/r").map(\.metrics.allocatedBytes) == [5 * GB, 7 * GB, 9 * GB])
+        #expect(try await service.sizeSeries(path: "/nope").isEmpty)
+    }
+
+    @Test func usageSeriesDecodesVolumeReportsOldestFirst() async throws {
+        let scratch = try ScratchDir("hist"); defer { scratch.cleanup() }
+        let service = try makeService(scratch)
+        let total: UInt64 = 1000 * GB
+        try await service.save(snapshot(completed: 300, entries: [entry("/r", 0, GB)], volume: volume(total: total, available: 400 * GB)))
+        try await service.save(snapshot(completed: 100, entries: [entry("/r", 0, GB)], volume: volume(total: total, available: 600 * GB)))
+        try await service.save(snapshot(completed: 200, entries: [entry("/r", 0, GB)]))           // no volume report ⇒ skipped
+        try await service.save(snapshot(root: "/other", completed: 250, entries: [entry("/other", 0, GB)],
+                                        volume: volume(total: total, available: 500 * GB)))        // any root counts
+
+        let usage = try await service.usageSeries()
+        #expect(usage.map(\.date.timeIntervalSince1970) == [100, 250, 300])
+        #expect(usage.map(\.usedBytes) == [400 * GB, 500 * GB, 600 * GB])
+        #expect(usage.allSatisfy { $0.totalBytes == total })
+    }
+
+    @Test func usageSeriesDeduplicatesByTimestampAndClampsUsed() async throws {
+        let scratch = try ScratchDir("hist"); defer { scratch.cleanup() }
+        let service = try makeService(scratch)
+        let total: UInt64 = 1000 * GB
+        try await service.save(snapshot(completed: 100, entries: [entry("/r", 0, GB)], volume: volume(total: total, available: 600 * GB)))
+        try await service.save(snapshot(root: "/other", completed: 100, entries: [entry("/other", 0, GB)],
+                                        volume: volume(total: total, available: 590 * GB)))
+        // available > total (reported mid-purge) must not underflow.
+        try await service.save(snapshot(completed: 200, entries: [entry("/r", 0, GB)], volume: volume(total: total, available: total + GB)))
+        let usage = try await service.usageSeries()
+        #expect(usage.count == 2)
+        #expect(usage[0].date.timeIntervalSince1970 == 100)
+        #expect(usage[1].usedBytes == 0)
+    }
+
+    @Test func seriesProtocolConformance() async throws {
+        let scratch = try ScratchDir("hist"); defer { scratch.cleanup() }
+        let provider: any SnapshotSeriesProviding = try makeService(scratch)
+        #expect(try await provider.usageSeries().isEmpty)
+        #expect(try await provider.sizeSeries(path: "/x").isEmpty)
+    }
+
+    // MARK: Schema migration
+
+    private func sqliteExec(_ url: URL, _ sql: String) {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK else {
+            Issue.record("cannot open \(url.path)"); return
+        }
+        defer { sqlite3_close(db) }
+        var error: UnsafeMutablePointer<CChar>?
+        if sqlite3_exec(db, sql, nil, nil, &error) != SQLITE_OK {
+            Issue.record("sqlite: \(error.map { String(cString: $0) } ?? "?")")
+            sqlite3_free(error)
+        }
+    }
+
+    private func sqliteScalar(_ url: URL, _ sql: String) -> String? {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW, let text = sqlite3_column_text(stmt, 0) else { return nil }
+        return String(cString: text)
+    }
+
+    @Test func v1DatabaseUpgradesInPlace() async throws {
+        let scratch = try ScratchDir("hist"); defer { scratch.cleanup() }
+        let dbURL = scratch.url.appendingPathComponent("db/history.sqlite")
+        try FileManager.default.createDirectory(at: dbURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let id = UUID().uuidString
+        // Exactly the v1 schema (no entries_path index, user_version 1) with one stored snapshot.
+        sqliteExec(dbURL, """
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE snapshots(
+          id TEXT PRIMARY KEY, root_path TEXT NOT NULL, started_at REAL NOT NULL, completed_at REAL NOT NULL,
+          logical INTEGER, allocated INTEGER, private INTEGER, cloud INTEGER, file_count INTEGER, dir_count INTEGER,
+          volume_json BLOB, entry_count INTEGER NOT NULL);
+        CREATE INDEX snapshots_root_time ON snapshots(root_path, completed_at DESC);
+        CREATE TABLE entries(
+          snapshot_id TEXT NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+          path TEXT NOT NULL, depth INTEGER NOT NULL, is_dir INTEGER NOT NULL,
+          logical INTEGER, allocated INTEGER, private INTEGER, cloud INTEGER, file_count INTEGER, dir_count INTEGER,
+          seq INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY(snapshot_id, path)) WITHOUT ROWID;
+        INSERT INTO snapshots VALUES('\(id)', '/r', 90, 100, 10, 20, 30, 0, 1, 1, NULL, 1);
+        INSERT INTO entries VALUES('\(id)', '/r', 0, 1, 10, 20, 30, 0, 1, 1, 0);
+        PRAGMA user_version=1;
+        """)
+        #expect(sqliteScalar(dbURL, "PRAGMA user_version") == "1")
+        #expect(sqliteScalar(dbURL, "SELECT name FROM sqlite_master WHERE name='entries_path'") == nil)
+
+        let service = try SnapshotHistoryService(databaseURL: dbURL)
+        #expect(sqliteScalar(dbURL, "PRAGMA user_version") == "2")
+        #expect(sqliteScalar(dbURL, "SELECT name FROM sqlite_master WHERE name='entries_path'") == "entries_path")
+
+        // Old data is intact and the new queries work on it.
+        let summaries = try await service.summaries(rootPath: nil)
+        #expect(summaries.count == 1)
+        #expect(summaries.first?.totals.allocatedBytes == 20)
+        let series = try await service.sizeSeries(path: "/r")
+        #expect(series.count == 1 && series[0].metrics.allocatedBytes == 20 && series[0].date.timeIntervalSince1970 == 100)
+        #expect(try await service.usageSeries().isEmpty)   // v1 row had no volume report
+
+        // New writes work, and re-opening an already-upgraded database is a no-op.
+        try await service.save(snapshot(completed: 500, entries: [entry("/r", 0, GB)]))
+        let reopened = try SnapshotHistoryService(databaseURL: dbURL)
+        #expect(try await reopened.sizeSeries(path: "/r").count == 2)
+        #expect(sqliteScalar(dbURL, "PRAGMA user_version") == "2")
+    }
+
+    @Test func freshDatabaseIsCreatedAtSchemaV2() async throws {
+        let scratch = try ScratchDir("hist"); defer { scratch.cleanup() }
+        _ = try makeService(scratch)
+        let dbURL = scratch.url.appendingPathComponent("db/history.sqlite")
+        #expect(sqliteScalar(dbURL, "PRAGMA user_version") == "2")
+        #expect(sqliteScalar(dbURL, "SELECT name FROM sqlite_master WHERE name='entries_path'") == "entries_path")
+    }
+
+    @Test func newerSchemaIsRejected() throws {
+        let scratch = try ScratchDir("hist"); defer { scratch.cleanup() }
+        _ = try makeService(scratch)
+        let dbURL = scratch.url.appendingPathComponent("db/history.sqlite")
+        sqliteExec(dbURL, "PRAGMA user_version=3")
+        #expect(throws: SnapshotHistoryError.self) { try SnapshotHistoryService(databaseURL: dbURL) }
+    }
 }
