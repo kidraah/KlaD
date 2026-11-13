@@ -115,7 +115,11 @@ final class AppState {
 
     // MARK: Locations
     private(set) var customLocations: [ScanLocation] = []
-    var locations: [ScanLocation] { [.disk, .home] + customLocations }
+    var locations: [ScanLocation] {
+        isDemo ? [.disk, ScanLocation(path: DemoData.home, title: "Home", symbol: "house")] : [.disk, .home] + customLocations
+    }
+    /// `--demo`: a fictional Mac for screenshots (no disk access, nothing saved).
+    private(set) var isDemo = false
     private(set) var currentLocation: ScanLocation?
 
     // MARK: Scan
@@ -361,6 +365,29 @@ final class AppState {
         if liveUpdates && !dirtyPaths.isEmpty {
             Task { await self.rescanDirty(automatic: true) }
         }
+    }
+
+    // MARK: - Demo
+
+    func loadDemo() {
+        isDemo = true
+        stopWatching()   // never persists a setting: demo mode leaves the user's preferences alone
+        let root = DemoData.makeTree()
+        let context = ClassificationContext(homeDirectory: DemoData.home, now: Date())
+        let classification = classifier.classify(root: root, context: context)
+        let now = Date()
+        result = ScanResult(root: root, options: ScanOptions(rootPath: DemoData.home), startedAt: now, completedAt: now,
+                            issues: [], unreadableCount: 0, privateSizeSupported: true, hardLinkDuplicateCount: 0, wasCancelled: false)
+        self.root = root
+        focus = root
+        selection = nil
+        volume = DemoData.volume()
+        scannedAt = now
+        categoryTotals = classification.categoryTotals
+        recommendations = classification.recommendations.sorted { $0.reclaimableBytes > $1.reclaimableBytes }
+        currentLocation = locations[1]
+        treeVersion += 1
+        phase = .ready
     }
 
     // MARK: - Scanning
@@ -817,7 +844,7 @@ final class AppState {
     /// One FSEvents stream for every scanned location (shown or stashed).
     private func restartWatching() {
         stopWatching()
-        guard liveUpdates else { return }
+        guard liveUpdates, !isDemo else { return }
         var roots = sessions.values.map(\.result.root.path)
         if let root { roots.append(root.path) }
         let paths = Array(Set(roots.map { $0 == "/" ? NSHomeDirectory() : $0 })).sorted()

@@ -93,7 +93,9 @@ enum FileIcons {
     static func icon(for node: FileTreeNode) -> NSImage {
         if node.isOpaque { return symbol("internaldrive") }
         if node.isProtectedLocation { return symbol("lock.fill") }
-        if node.parent == nil { return volumeOrFolderIcon(path: node.path) }
+        if node.parent == nil {
+            return FileManager.default.fileExists(atPath: node.path) ? volumeOrFolderIcon(path: node.path) : typeIcon(.folder)
+        }
         if node.isDirectory {
             // App bundles and the home folder's special folders get their real
             // icon; everything else uses the generic folder (no file access).

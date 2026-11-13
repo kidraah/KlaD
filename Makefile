@@ -6,6 +6,8 @@
 #   make test       full Swift Testing suite (handles CLT-only toolchains)
 #   make probe      release build of the headless scanner probe
 #   make icon       regenerate Resources/AppIcon.icns
+#   make media      README screenshots, GIFs and videos (fictional demo data)
+#   make dmg        universal (Apple silicon + Intel) build/KlaD-<version>.dmg
 #
 # Signing: if the local identity from `make signing-identity` exists it is used,
 # so macOS remembers folder permissions across rebuilds; otherwise ad-hoc ("-").
@@ -28,7 +30,7 @@ endif
 SWIFT      ?= swift
 BIN_DIR     = $(shell $(SWIFT) build -c $(CONFIG) --show-bin-path)
 
-.PHONY: all build app run scan-home test probe icon clean signing-identity unlock-signing
+.PHONY: all build app run scan-home test probe icon clean signing-identity unlock-signing universal dmg media
 
 all: app
 
@@ -53,6 +55,38 @@ app: build unlock-signing
 	@codesign --force --timestamp=none --options runtime $(SIGN_FLAGS) --sign "$(SIGN_ID)" "$(APP)"
 	@codesign --verify --strict --verbose=1 "$(APP)"
 	@echo "Built $(APP)"
+
+VERSION    := $(shell /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" Info.plist)
+DMG        := $(BUILD_DIR)/$(APP_NAME)-$(VERSION).dmg
+
+# One binary for Apple silicon and Intel, then the same bundle + signing as `app`.
+universal: unlock-signing
+	$(SWIFT) build -c release --product $(APP_NAME) --triple arm64-apple-macosx14.0
+	$(SWIFT) build -c release --product $(APP_NAME) --triple x86_64-apple-macosx14.0
+	@rm -rf "$(APP)"
+	@mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources"
+	@lipo -create -output "$(APP)/Contents/MacOS/$(APP_NAME)" \
+		.build/arm64-apple-macosx/release/$(APP_NAME) .build/x86_64-apple-macosx/release/$(APP_NAME)
+	@cp Info.plist "$(APP)/Contents/Info.plist"
+	@if [ -f Resources/AppIcon.icns ]; then cp Resources/AppIcon.icns "$(APP)/Contents/Resources/AppIcon.icns"; fi
+	@codesign --force --timestamp=none --options runtime $(SIGN_FLAGS) --sign "$(SIGN_ID)" "$(APP)"
+	@codesign --verify --strict --verbose=1 "$(APP)"
+	@lipo -archs "$(APP)/Contents/MacOS/$(APP_NAME)"
+
+# Drag-to-Applications disk image.
+dmg: universal
+	@rm -rf "$(BUILD_DIR)/dmg" "$(DMG)"
+	@mkdir -p "$(BUILD_DIR)/dmg"
+	@cp -R "$(APP)" "$(BUILD_DIR)/dmg/"
+	@ln -s /Applications "$(BUILD_DIR)/dmg/Applications"
+	@hdiutil create -quiet -volname "$(APP_NAME) $(VERSION)" -srcfolder "$(BUILD_DIR)/dmg" -fs APFS -format ULFO -ov "$(DMG)"
+	@codesign --force --timestamp=none $(SIGN_FLAGS) --sign "$(SIGN_ID)" "$(DMG)"
+	@rm -rf "$(BUILD_DIR)/dmg"
+	@shasum -a 256 "$(DMG)"
+	@echo "Built $(DMG)"
+
+media: app
+	Scripts/make-media.sh
 
 run: app
 	open "$(APP)"

@@ -93,10 +93,14 @@ final class AppUninstaller {
 
     // MARK: Discovery
 
+    /// Demo screenshots show only these common apps, never the user's whole list.
+    var demoAllowlist: Set<String>?
+
     func loadApps() {
         guard !isLoadingApps else { return }
         isLoadingApps = true
         let home = self.home
+        let allowlist = demoAllowlist
         Task.detached(priority: .userInitiated) {
             var found: [InstalledApp] = []
             for folder in SystemPolicy.applicationFolders(home: home) {
@@ -106,6 +110,7 @@ final class AppUninstaller {
                     let info = Self.infoPlist(of: path)
                     let bundleID = info["CFBundleIdentifier"] as? String
                     guard SystemPolicy.mayUninstall(appPath: path, bundleID: bundleID, home: home) else { continue }
+                    if let allowlist, !allowlist.contains(String(name.dropLast(4))) { continue }
                     let display = (info["CFBundleDisplayName"] as? String) ?? (info["CFBundleName"] as? String) ?? String(name.dropLast(4))
                     found.append(InstalledApp(path: path, name: display, bundleID: bundleID,
                                               version: info["CFBundleShortVersionString"] as? String))

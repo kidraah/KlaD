@@ -6,3 +6,6 @@
 *.xcworkspace/
 xcuserdata/
 .swiftpm/
+
+# Demo videos are release assets, not git objects
+docs/media/*.mp4

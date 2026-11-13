@@ -34,12 +34,25 @@ struct ContentView: View {
             if let section = LaunchOptions.section { app.sidebarSelection = .section(section) }
             if let name = LaunchOptions.uninstallerApp {
                 app.sidebarSelection = .uninstaller
+                if LaunchOptions.demo {
+                    app.uninstaller.demoAllowlist = ["Blender", "Docker", "Google Chrome", "Notion", "VLC", "Visual Studio Code",
+                                                     "Slack", "Spotify", "Figma", "Zoom", "Android Studio", "OBS", "Discord", "Firefox"]
+                }
                 app.uninstaller.loadApps()
                 for _ in 0..<100 where app.uninstaller.apps.isEmpty { try? await Task.sleep(for: .milliseconds(50)) }
                 app.uninstaller.selectedAppID = app.uninstaller.apps.first { $0.name == name }?.id
             }
             if let mode = LaunchOptions.mode { app.visualizerMode = mode }
-            if let path = LaunchOptions.scanPath {
+            if LaunchOptions.demo {
+                app.loadDemo()
+                if LaunchOptions.uninstallerApp != nil { app.sidebarSelection = .uninstaller }
+                if let focus = LaunchOptions.focusPath, let node = app.root?.descendant(atPath: DemoData.home + "/" + focus) {
+                    app.drill(into: node)
+                }
+                if let select = LaunchOptions.selectPath, let node = app.root?.descendant(atPath: DemoData.home + "/" + select) {
+                    app.select(node)
+                }
+            } else if let path = LaunchOptions.scanPath {
                 let location = path == "/" ? ScanLocation.disk
                     : (path == NSHomeDirectory() ? ScanLocation.home : app.addLocation(path: path))
                 app.open(location)
@@ -176,6 +189,10 @@ enum LaunchOptions {
     static var section: InsightSection? { value(after: "--section").flatMap(InsightSection.init(rawValue:)) }
     /// `--uninstaller <App Name>` opens the uninstaller with that app selected (testing aid; removes nothing).
     static var uninstallerApp: String? { value(after: "--uninstaller") }
+    /// `--demo` fictional data; `--focus <rel path>` / `--select <rel path>` inside it.
+    static var demo: Bool { ProcessInfo.processInfo.arguments.contains("--demo") }
+    static var focusPath: String? { value(after: "--focus") }
+    static var selectPath: String? { value(after: "--select") }
     /// `--mode sunburst|treemap`
     static var mode: VisualizerMode? { value(after: "--mode").flatMap(VisualizerMode.init(rawValue:)) }
 
