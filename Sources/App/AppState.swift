@@ -250,14 +250,113 @@ final class AppState {
         if let data = try? JSONEncoder().encode(customLocations) { defaults.set(data, forKey: "customLocations") }
     }
 
+    // MARK: Per-location sessions (switching never rescans)
+
+    /// Everything shown for one scanned location, kept in memory so switching
+    /// back is instant. Stashed sessions keep collecting FSEvents changes and
+    /// catch up (changed folders only) when shown again.
+    private struct LocationSession {
+        let location: ScanLocation
+        let result: ScanResult
+        let focus: FileTreeNode?
+        let selection: FileTreeNode?
+        let volume: VolumeSpaceReport?
+        let scannedAt: Date?
+        let recommendations: [CleanupRecommendation]
+        let categoryTotals: [StorageCategory: StorageMetrics]
+        let duplicateGroups: [DuplicateGroup]
+        let duplicatesSearched: Bool
+        let duplicateCandidates: [DuplicateCandidate]
+        let lastRescanSummary: String?
+        var dirtyPaths: [DirtyPath]
+        var needsFullRescan: Bool
+    }
+
+    /// Most-recently-used last; at most `maxSessions` kept (memory).
+    @ObservationIgnored private var sessions: [String: LocationSession] = [:]
+    @ObservationIgnored private var sessionOrder: [String] = []
+    private static let maxSessions = 3
+
+    /// Locations whose results are ready to show instantly.
+    private(set) var cachedLocationPaths: Set<String> = []
+
+    /// Shows a location: instantly if it was scanned this session, otherwise scans it.
     func open(_ location: ScanLocation) {
+        if location == currentLocation, root != nil || isBusy { return }
+        stashCurrent()
         currentLocation = location
+        if let session = sessions.removeValue(forKey: location.path) {
+            sessionOrder.removeAll { $0 == location.path }
+            restore(session)
+        } else {
+            startScan(path: location.path)
+        }
+        cachedLocationPaths = Set(sessions.keys).union(root.map { _ in [location.path] } ?? [])
+    }
+
+    /// Full rescan of the current location (the only thing that rescans everything).
+    func rescan() {
+        guard let location = currentLocation else { return }
+        sessions[location.path] = nil
+        sessionOrder.removeAll { $0 == location.path }
         startScan(path: location.path)
     }
 
-    func rescan() {
-        guard let location = currentLocation else { return }
+    /// Full rescan of any location from the sidebar.
+    func rescan(_ location: ScanLocation) {
+        if location == currentLocation { rescan(); return }
+        sessions[location.path] = nil
+        sessionOrder.removeAll { $0 == location.path }
         open(location)
+    }
+
+    private func stashCurrent() {
+        guard let location = currentLocation else { return }
+        guard phase == .ready, let result else {
+            if isBusy { cancelScan() }
+            return
+        }
+        sessions[location.path] = LocationSession(
+            location: location, result: result, focus: focus, selection: selection, volume: volume,
+            scannedAt: scannedAt, recommendations: recommendations, categoryTotals: categoryTotals,
+            duplicateGroups: duplicateGroups, duplicatesSearched: duplicatesSearched,
+            duplicateCandidates: duplicateCandidates, lastRescanSummary: lastRescanSummary,
+            dirtyPaths: dirtyPaths, needsFullRescan: needsFullRescan)
+        sessionOrder.removeAll { $0 == location.path }
+        sessionOrder.append(location.path)
+        while sessionOrder.count > Self.maxSessions {
+            sessions[sessionOrder.removeFirst()] = nil
+        }
+        duplicateTask?.cancel()
+        isFindingDuplicates = false
+    }
+
+    private func restore(_ session: LocationSession) {
+        result = session.result
+        root = session.result.root
+        focus = session.focus ?? session.result.root
+        selection = session.selection
+        volume = session.volume
+        scannedAt = session.scannedAt
+        recommendations = session.recommendations
+        categoryTotals = session.categoryTotals
+        duplicateGroups = session.duplicateGroups
+        duplicatesSearched = session.duplicatesSearched
+        duplicateCandidates = session.duplicateCandidates
+        lastRescanSummary = session.lastRescanSummary
+        dirtyPaths = session.dirtyPaths
+        needsFullRescan = session.needsFullRescan
+        diff = nil
+        diffBaseID = nil
+        treeVersion += 1
+        phase = .ready
+        refreshVolume()
+        Task { await self.reloadHistory() }
+        restartWatching()
+        // Catch up on what changed while this location wasn't shown.
+        if liveUpdates && !dirtyPaths.isEmpty {
+            Task { await self.rescanDirty(automatic: true) }
+        }
     }
 
     // MARK: - Scanning
@@ -379,7 +478,8 @@ final class AppState {
         snapshot.volume = report
         Task { await self.saveAndReloadHistory(snapshot) }
         Task { await self.enrichWithGitSignals() }
-        if liveUpdates { startWatching(path: scanResult.root.path) }
+        cachedLocationPaths.insert(currentLocation?.path ?? scanResult.root.path)
+        restartWatching()
     }
 
     private func makeClassificationContext() -> ClassificationContext {
@@ -683,13 +783,17 @@ final class AppState {
     // MARK: - Live updates (FSEvents)
 
     private func liveUpdatesChanged() {
-        if liveUpdates, let root { startWatching(path: root.path) } else { stopWatching() }
+        restartWatching()
     }
 
-    private func startWatching(path: String) {
+    /// One FSEvents stream for every scanned location (shown or stashed).
+    private func restartWatching() {
         stopWatching()
-        let watchPath = path == "/" ? NSHomeDirectory() : path
-        guard let stream = try? watcher.start(paths: [watchPath], latency: 2.5) else { return }
+        guard liveUpdates else { return }
+        var roots = sessions.values.map(\.result.root.path)
+        if let root { roots.append(root.path) }
+        let paths = Array(Set(roots.map { $0 == "/" ? NSHomeDirectory() : $0 })).sorted()
+        guard !paths.isEmpty, let stream = try? watcher.start(paths: paths, latency: 2.5) else { return }
         watchTask = Task { [weak self] in
             for await batch in stream {
                 self?.absorb(batch)
@@ -705,18 +809,19 @@ final class AppState {
         watcher.stop()
     }
 
-    private func absorb(_ batch: DirtyPathBatch) {
-        guard let root else { return }
-        let rootPath = root.path
+    /// Merges a batch into a location's dirty set (minimal cover). Returns
+    /// whether the location's root itself needs a full rescan.
+    private static func merge(_ existing: [DirtyPath], _ batch: [DirtyPath], rootPath: String) -> ([DirtyPath], Bool) {
         let rootPrefix = rootPath == "/" ? "/" : rootPath + "/"
-        var merged = dirtyPaths
-        for dirty in batch.paths where dirty.path == rootPath || dirty.path.hasPrefix(rootPrefix) {
+        var merged = existing
+        var full = false
+        for dirty in batch where dirty.path == rootPath || dirty.path.hasPrefix(rootPrefix) {
             if dirty.path == rootPath {
-                if dirty.recursive { needsFullRescan = true }
+                if dirty.recursive { full = true }
                 continue
             }
-            if let existing = merged.firstIndex(where: { $0.path == dirty.path }) {
-                merged[existing].recursive = merged[existing].recursive || dirty.recursive
+            if let index = merged.firstIndex(where: { $0.path == dirty.path }) {
+                merged[index].recursive = merged[index].recursive || dirty.recursive
             } else {
                 merged.append(dirty)
             }
@@ -726,6 +831,20 @@ final class AppState {
         for candidate in merged where !cover.contains(where: { candidate.path.hasPrefix($0.path + "/") }) {
             cover.append(candidate)
         }
+        return (cover, full)
+    }
+
+    private func absorb(_ batch: DirtyPathBatch) {
+        for key in Array(sessions.keys) {
+            guard var session = sessions[key] else { continue }
+            let (cover, full) = Self.merge(session.dirtyPaths, batch.paths, rootPath: session.result.root.path)
+            session.dirtyPaths = cover
+            session.needsFullRescan = session.needsFullRescan || full
+            sessions[key] = session
+        }
+        guard let root else { return }
+        let (cover, full) = Self.merge(dirtyPaths, batch.paths, rootPath: root.path)
+        if full { needsFullRescan = true }
         dirtyPaths = cover
         guard liveUpdates, !cover.isEmpty, rescanThrottle == nil else { return }
         // Throttle (not debounce): constant churn must not postpone updates forever.

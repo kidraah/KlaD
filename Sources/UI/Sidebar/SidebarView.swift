@@ -21,7 +21,7 @@ struct SidebarView: View {
                     }
                     .tag(SidebarItem.location(location.path))
                     .contextMenu {
-                        Button("Rescan") { app.open(location) }
+                        Button("Rescan") { app.rescan(location) }
                         if location.path != "/" {
                             Button("Show in Finder") { SystemActions.reveal(location.path) }
                         }
