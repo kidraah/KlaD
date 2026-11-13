@@ -14,7 +14,10 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 300)
         } detail: {
             DetailView()
-                .inspector(isPresented: $app.showInspector) {
+                .inspector(isPresented: Binding(
+                    get: { app.showInspector && app.sidebarSelection != .uninstaller },
+                    set: { app.showInspector = $0 }
+                )) {
                     InspectorView()
                         .inspectorColumnWidth(min: 260, ideal: 300, max: 440)
                 }
@@ -29,6 +32,12 @@ struct ContentView: View {
             app.appearance.apply()
             LaunchOptions.applyAppearance()
             if let section = LaunchOptions.section { app.sidebarSelection = .section(section) }
+            if let name = LaunchOptions.uninstallerApp {
+                app.sidebarSelection = .uninstaller
+                app.uninstaller.loadApps()
+                for _ in 0..<100 where app.uninstaller.apps.isEmpty { try? await Task.sleep(for: .milliseconds(50)) }
+                app.uninstaller.selectedAppID = app.uninstaller.apps.first { $0.name == name }?.id
+            }
             if let mode = LaunchOptions.mode { app.visualizerMode = mode }
             if let path = LaunchOptions.scanPath {
                 let location = path == "/" ? ScanLocation.disk
@@ -56,6 +65,18 @@ struct DetailView: View {
 
     var body: some View {
         Group {
+            if app.sidebarSelection == .uninstaller {
+                AppUninstallerView()
+            } else {
+                locationContent
+            }
+        }
+        .frame(minWidth: 520, minHeight: 420)
+    }
+
+    @ViewBuilder
+    private var locationContent: some View {
+        Group {
             switch app.phase {
             case .idle where app.root == nil:
                 WelcomeView()
@@ -78,7 +99,6 @@ struct DetailView: View {
                 }
             }
         }
-        .frame(minWidth: 520, minHeight: 420)
     }
 }
 
@@ -89,7 +109,7 @@ struct MainToolbar: ToolbarContent {
 
     var body: some ToolbarContent {
         @Bindable var app = app
-        if app.section == .overview && app.hasResults {
+        if app.section == .overview && app.hasResults && app.sidebarSelection != .uninstaller {
             ToolbarItem(placement: .principal) {
                 Picker("Chart", selection: $app.visualizerMode) {
                     ForEach(VisualizerMode.allCases) { mode in
@@ -128,6 +148,7 @@ struct MainToolbar: ToolbarContent {
                 .help("Scan this location again")
             }
         }
+        if app.sidebarSelection != .uninstaller {
         ToolbarItem(placement: .primaryAction) {
             Button {
                 app.showInspector.toggle()
@@ -135,6 +156,7 @@ struct MainToolbar: ToolbarContent {
                 Label("Inspector", systemImage: "sidebar.trailing")
             }
             .help(app.showInspector ? "Hide Inspector" : "Show Inspector")
+        }
         }
     }
 }
@@ -152,6 +174,8 @@ enum LaunchOptions {
     static var scanPath: String? { value(after: "--scan").map { ($0 as NSString).expandingTildeInPath } }
     /// `--section overview|recommendations|duplicates|history`
     static var section: InsightSection? { value(after: "--section").flatMap(InsightSection.init(rawValue:)) }
+    /// `--uninstaller <App Name>` opens the uninstaller with that app selected (testing aid; removes nothing).
+    static var uninstallerApp: String? { value(after: "--uninstaller") }
     /// `--mode sunburst|treemap`
     static var mode: VisualizerMode? { value(after: "--mode").flatMap(VisualizerMode.init(rawValue:)) }
 

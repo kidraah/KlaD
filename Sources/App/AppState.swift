@@ -79,6 +79,7 @@ enum InsightSection: String, CaseIterable, Identifiable, Hashable {
 enum SidebarItem: Hashable {
     case location(String)
     case section(InsightSection)
+    case uninstaller
 }
 
 struct CleanupRequest: Identifiable {
@@ -156,6 +157,9 @@ final class AppState {
     private(set) var lastRescanSummary: String?
     private var watchTask: Task<Void, Never>?
     private var rescanThrottle: Task<Void, Never>?
+
+    // MARK: Uninstaller
+    let uninstaller = AppUninstaller()
 
     // MARK: Cleanup
     var cleanupRequest: CleanupRequest?
@@ -350,7 +354,7 @@ final class AppState {
         diffBaseID = nil
         treeVersion += 1
         phase = .ready
-        refreshVolume()
+        refreshCapacities()
         Task { await self.reloadHistory() }
         restartWatching()
         // Catch up on what changed while this location wasn't shown.
@@ -568,12 +572,36 @@ final class AppState {
 
     // MARK: - Volume
 
+    /// Full volume report (spawns diskutil/tmutil): only after a full scan.
     func refreshVolume() {
         let path = root?.path ?? currentLocation?.path ?? NSHomeDirectory()
         let inspector = volumeInspector
         Task { [weak self] in
             let report = await inspector.report(forPath: path)
             self?.volume = report
+        }
+    }
+
+    /// Cheap free-space refresh (no subprocesses) after cleanups and live updates.
+    func refreshCapacities() {
+        guard let current = volume else { return refreshVolume() }
+        let url = URL(fileURLWithPath: current.volumePath)
+        Task.detached(priority: .utility) { [weak self] in
+            guard let values = try? url.resourceValues(forKeys: [
+                .volumeAvailableCapacityKey, .volumeAvailableCapacityForImportantUsageKey,
+                .volumeAvailableCapacityForOpportunisticUsageKey,
+            ]) else { return }
+            await MainActor.run {
+                guard let self, var report = self.volume, report.volumePath == current.volumePath else { return }
+                if let available = values.volumeAvailableCapacity { report.availableCapacity = UInt64(max(0, available)) }
+                if let important = values.volumeAvailableCapacityForImportantUsage {
+                    report.availableForImportantUsage = max(UInt64(max(0, important)), report.availableCapacity)
+                }
+                if let opportunistic = values.volumeAvailableCapacityForOpportunisticUsage {
+                    report.availableForOpportunisticUsage = UInt64(max(0, opportunistic))
+                }
+                if report != self.volume { self.volume = report }
+            }
         }
     }
 
@@ -681,7 +709,7 @@ final class AppState {
         guard outcome.succeeded else { return outcome }
         applyRemoval(path: request.target.path)
         reclaimedThisSession += outcome.reclaimedPrivateBytes
-        refreshVolume()
+        refreshCapacities()
         return outcome
     }
 
@@ -828,9 +856,21 @@ final class AppState {
         }
         merged.sort { $0.path.count < $1.path.count }
         var cover: [DirtyPath] = []
-        for candidate in merged where !cover.contains(where: { candidate.path.hasPrefix($0.path + "/") }) {
+        var coverSet = Set<String>()
+        for candidate in merged {
+            // Walk up the candidate's ancestors (O(depth)) instead of scanning the cover.
+            var ancestor = (candidate.path as NSString).deletingLastPathComponent
+            var covered = false
+            while ancestor.count > 1 && ancestor.count >= rootPath.count {
+                if coverSet.contains(ancestor) { covered = true; break }
+                ancestor = (ancestor as NSString).deletingLastPathComponent
+            }
+            if covered { continue }
             cover.append(candidate)
+            coverSet.insert(candidate.path)
         }
+        // Bounded: beyond this, a full rescan is the better answer anyway.
+        if cover.count > 400 { return (Array(cover.prefix(400)), true) }
         return (cover, full)
     }
 
@@ -845,15 +885,24 @@ final class AppState {
         guard let root else { return }
         let (cover, full) = Self.merge(dirtyPaths, batch.paths, rootPath: root.path)
         if full { needsFullRescan = true }
-        dirtyPaths = cover
-        guard liveUpdates, !cover.isEmpty, rescanThrottle == nil else { return }
-        // Throttle (not debounce): constant churn must not postpone updates forever.
+        if cover != dirtyPaths { dirtyPaths = cover }
+        guard liveUpdates, rescanThrottle == nil, cover.contains(where: { !Self.isBackgroundChurn($0.path) }) else { return }
+        // Throttle (not debounce), and only while KlaD is the active app.
         rescanThrottle = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(6))
+            try? await Task.sleep(for: .seconds(20))
+            while !Task.isCancelled, !NSApp.isActive {
+                try? await Task.sleep(for: .seconds(5))
+            }
             guard !Task.isCancelled else { return }
             await self?.rescanDirty(automatic: true)
             self?.rescanThrottle = nil
         }
+    }
+
+    /// ~/Library is rewritten constantly by macOS and apps (Spotlight, caches,
+    /// browsers). Automatic updates skip it; Update Now / Rescan still cover it.
+    private static func isBackgroundChurn(_ path: String) -> Bool {
+        path.hasPrefix(NSHomeDirectory() + "/Library/") || path.contains("/.Trash") || path.hasPrefix("/private/")
     }
 
     /// Rescans changed subtrees (gently) and splices them into the live tree.
@@ -861,9 +910,11 @@ final class AppState {
         guard let root, !isRescanning, !isBusy, !dirtyPaths.isEmpty else { return }
         isRescanning = true
         defer { isRescanning = false }
-        let pending = dirtyPaths
-        var remaining: [DirtyPath] = []
+        let pending = automatic ? dirtyPaths.filter { !Self.isBackgroundChurn($0.path) } : dirtyPaths
+        let deferred = automatic ? dirtyPaths.filter { Self.isBackgroundChurn($0.path) } : []
+        var remaining: [DirtyPath] = deferred
         var spliced = 0
+        var changedBytes: Int64 = 0
         let context = makeClassificationContext()
 
         for dirty in pending.prefix(24) {
@@ -903,6 +954,7 @@ final class AppState {
                 let oldPath = target.path
                 if let focus, focus === target || focus.ancestors.contains(where: { $0 === target }) { self.focus = fresh }
                 if let selection, selection === target || selection.ancestors.contains(where: { $0 === target }) { self.selection = nil }
+                changedBytes += Int64(bitPattern: fresh.metrics.allocatedBytes) - Int64(bitPattern: target.metrics.allocatedBytes)
                 target.replace(with: fresh)
                 let prefix = oldPath + "/"
                 recommendations.removeAll { $0.path == oldPath || $0.path.hasPrefix(prefix) }
@@ -919,9 +971,10 @@ final class AppState {
         let handled = Set(pending.map(\.path))
         dirtyPaths = remaining + dirtyPaths.filter { !handled.contains($0.path) }
         if spliced > 0 {
-            treeVersion += 1
+            // Redraw the charts only when sizes moved enough to be visible.
+            if !automatic || changedBytes.magnitude >= 1_000_000 { treeVersion += 1 }
             lastRescanSummary = "Updated \(spliced) changed folder\(spliced == 1 ? "" : "s") at \(Date().formatted(date: .omitted, time: .shortened))"
-            refreshVolume()
+            refreshCapacities()
         }
     }
 }

@@ -228,6 +228,22 @@ public enum SystemPolicy {
         return true
     }
 
+    /// Folders whose apps KlaD may uninstall (user-installed apps only).
+    public static func applicationFolders(home: String) -> [String] {
+        ["/Applications", home + "/Applications"]
+    }
+
+    /// Whether KlaD may move an application bundle to the Trash: a direct
+    /// `.app` child of /Applications or ~/Applications that is not Apple's.
+    public static func mayUninstall(appPath: String, bundleID: String?, home: String) -> Bool {
+        let normalized = normalize(appPath)
+        guard normalized.hasSuffix(".app") else { return false }
+        let parent = (normalized as NSString).deletingLastPathComponent
+        guard applicationFolders(home: home).contains(parent) else { return false }
+        if let bundleID, bundleID.lowercased().hasPrefix("com.apple.") { return false }
+        return true
+    }
+
     /// Lexical normalization: strips trailing slashes and "." components.
     public static func normalize(_ path: String) -> String {
         var parts: [Substring] = []

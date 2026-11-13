@@ -193,7 +193,11 @@ final class ScanSession: @unchecked Sendable {
         self.rootName = rootName ?? rootPath
         self.progress = progress
         let cores = ProcessInfo.processInfo.activeProcessorCount
-        self.threadCount = options.concurrency > 0 ? options.concurrency : min(max(cores, 4), 16)
+        // Measured on a 10-core Mac (2.46 M items): 6 threads = 7.7 s / 23 CPU-s,
+        // 16 threads = 7.2 s / 56 CPU-s. More threads only burn the CPU the rest
+        // of the system needs, so cap at 6 (and leave at least two cores free).
+        let automatic = min(6, max(2, cores - 2))
+        self.threadCount = options.concurrency > 0 ? options.concurrency : (options.lowPriority ? 2 : automatic)
 
         var st = stat()
         guard lstat(rootPath, &st) == 0 else { throw ScannerError.rootNotFound(path: rootPath, errorCode: errno) }

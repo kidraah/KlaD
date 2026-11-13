@@ -33,6 +33,11 @@ struct SidebarView: View {
                 }
             }
 
+            Section("Tools") {
+                Label("Uninstall Apps", systemImage: "trash.square")
+                    .tag(SidebarItem.uninstaller)
+            }
+
             if app.hasResults {
                 Section(app.currentLocation?.title ?? "Results") {
                     ForEach(InsightSection.allCases) { section in
@@ -70,7 +75,7 @@ struct SidebarView: View {
                 app.sidebarSelection = .section(lastSection)
             case .section(let section):
                 lastSection = section
-            case nil:
+            case .uninstaller, nil:
                 break
             }
         }
