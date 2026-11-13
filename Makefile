@@ -6,7 +6,8 @@
 #   make test       full Swift Testing suite (handles CLT-only toolchains)
 #   make probe      release build of the headless scanner probe
 #   make icon       regenerate Resources/AppIcon.icns
-#   make media      README screenshots, GIFs and videos (fictional demo data)
+#   make media      README screenshots (fictional demo data)
+#   make demo-video record the live README demo (drives the mouse ~40 s per theme)
 #   make dmg        universal (Apple silicon + Intel) build/KlaD-<version>.dmg
 #
 # Signing: if the local identity from `make signing-identity` exists it is used,
@@ -30,7 +31,7 @@ endif
 SWIFT      ?= swift
 BIN_DIR     = $(shell $(SWIFT) build -c $(CONFIG) --show-bin-path)
 
-.PHONY: all build app run scan-home test probe icon clean signing-identity unlock-signing universal dmg media
+.PHONY: all build app run scan-home test probe icon clean signing-identity unlock-signing universal dmg media demo-video
 
 all: app
 
@@ -87,6 +88,10 @@ dmg: universal
 
 media: app
 	Scripts/make-media.sh
+
+demo-video: app
+	Scripts/record-demo.sh light docs/media
+	Scripts/record-demo.sh dark docs/media
 
 run: app
 	open "$(APP)"

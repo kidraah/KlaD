@@ -21,11 +21,11 @@ Native. Fast. Free. And it never touches what it shouldn't.
 <br><br>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/media/tour-dark.gif">
-  <img src="docs/media/tour-light.gif" width="100%" alt="KlaD tour: drilling into a sunburst, switching to the heat-map treemap, reviewing recommendations and uninstalling an app">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/live-dark.gif">
+  <img src="docs/media/live-light.gif" width="100%" alt="Recorded live: hovering and drilling into the sunburst, the heat-map treemap, recommendations and the app uninstaller">
 </picture>
 
-<sub>Real app, fictional Mac. The tour follows your system's Light or Dark mode.</sub>
+<sub>Recorded live, real clicks and hovers, at 60 fps. The Mac in it is fictional. It follows your Light or Dark mode.</sub>
 
 </div>
 
@@ -168,12 +168,15 @@ make signing-identity   # once: a local signing identity, so macOS remembers fol
 make run                # release build → build/KlaD.app, then open it
 make test               # 144 Swift Testing tests
 make dmg                # universal build → build/KlaD-<version>.dmg
-make media              # regenerate every screenshot, GIF and video in this README
+make media              # regenerate the screenshots in this README
+make demo-video         # record the live demo (drives the mouse for ~40 s per theme)
 make probe              # headless scanner: klad-probe scan ~ | verify <dir> | volume /
 ```
 
 The README media come from `--demo`, a fictional Mac built in memory — nothing from your disk ends up in a screenshot.
-The videos are rendered by [`Scripts/render-demo.swift`](Scripts/render-demo.swift): real captures, an eased camera that follows the cursor, click ripples.
+The demo is a live recording: [`Scripts/record-demo.swift`](Scripts/record-demo.swift) drives the real mouse and captures
+KlaD with ScreenCaptureKit, then [`Scripts/render-demo.swift`](Scripts/render-demo.swift) adds the backdrop, an eased
+camera that follows the cursor, and click ripples.
 
 </details>
 

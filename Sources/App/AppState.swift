@@ -371,6 +371,9 @@ final class AppState {
 
     func loadDemo() {
         isDemo = true
+        // Screenshots and recordings show a few common apps, never the user's whole list.
+        uninstaller.demoAllowlist = ["Blender", "Docker", "Google Chrome", "Notion", "VLC", "Visual Studio Code",
+                                     "Slack", "Spotify", "Figma", "Zoom", "Android Studio", "OBS", "Discord", "Firefox"]
         stopWatching()   // never persists a setting: demo mode leaves the user's preferences alone
         let root = DemoData.makeTree()
         let context = ClassificationContext(homeDirectory: DemoData.home, now: Date())

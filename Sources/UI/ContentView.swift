@@ -34,10 +34,7 @@ struct ContentView: View {
             if let section = LaunchOptions.section { app.sidebarSelection = .section(section) }
             if let name = LaunchOptions.uninstallerApp {
                 app.sidebarSelection = .uninstaller
-                if LaunchOptions.demo {
-                    app.uninstaller.demoAllowlist = ["Blender", "Docker", "Google Chrome", "Notion", "VLC", "Visual Studio Code",
-                                                     "Slack", "Spotify", "Figma", "Zoom", "Android Studio", "OBS", "Discord", "Firefox"]
-                }
+                if LaunchOptions.demo { app.loadDemo() }
                 app.uninstaller.loadApps()
                 for _ in 0..<100 where app.uninstaller.apps.isEmpty { try? await Task.sleep(for: .milliseconds(50)) }
                 app.uninstaller.selectedAppID = app.uninstaller.apps.first { $0.name == name }?.id
