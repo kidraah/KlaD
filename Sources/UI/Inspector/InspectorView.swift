@@ -1,6 +1,5 @@
 // InspectorView.swift — Get Info-style inspector for the selected item.
 
-import Charts
 import SwiftUI
 import KlaDModels
 
@@ -76,7 +75,7 @@ private struct NodeInspector: View {
                         LabeledContent("In iCloud only", value: formatBytes(m.cloudStubBytes))
                     }
                     if node.isDirectory {
-                        LabeledContent("Contains", value: "\(m.fileCount.formatted()) files, \(m.directoryCount.formatted()) folders")
+                        LabeledContent("Contains", value: "\(formatInteger(m.fileCount)) files, \(formatInteger(m.directoryCount)) folders")
                     }
                 }
                 if node.modificationTime > 0 && !node.isOpaque {
@@ -112,30 +111,6 @@ private struct NodeInspector: View {
                                 .font(.callout)
                                 .foregroundStyle(signal.isWarning ? .orange : .secondary)
                         }
-                    }
-                }
-            }
-
-            if app.folderSeries.count >= 2, app.selection === node {
-                Section("Size History") {
-                    Chart(app.folderSeries, id: \.date) { sample in
-                        LineMark(x: .value("Date", sample.date), y: .value("Size", Double(sample.metrics.allocatedBytes)))
-                            .interpolationMethod(.monotone)
-                        PointMark(x: .value("Date", sample.date), y: .value("Size", Double(sample.metrics.allocatedBytes)))
-                            .symbolSize(18)
-                    }
-                    .chartYAxis {
-                        AxisMarks(position: .leading) { value in
-                            AxisGridLine()
-                            AxisValueLabel { if let v = value.as(Double.self) { Text(formatBytes(UInt64(max(0, v)))) } }
-                        }
-                    }
-                    .frame(height: 120)
-                    if let first = app.folderSeries.first, let last = app.folderSeries.last {
-                        let delta = Int64(bitPattern: last.metrics.allocatedBytes) - Int64(bitPattern: first.metrics.allocatedBytes)
-                        Text("\(formatSignedBytes(delta)) since \(first.date.formatted(date: .abbreviated, time: .omitted))")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
                     }
                 }
             }

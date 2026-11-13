@@ -55,10 +55,6 @@ struct RecommendationsView: View {
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
                     }
-                    if level == .safeToClear && app.batchCandidates.count > 1 {
-                        Button("Review All…") { app.requestBatchCleanup() }
-                            .controlSize(.small)
-                    }
                 }
             } footer: {
                 Text(footer)

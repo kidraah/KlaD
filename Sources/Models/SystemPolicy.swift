@@ -41,6 +41,18 @@ public struct ProtectedLocation: Sendable, Hashable, Identifiable {
     }
 }
 
+/// Minimal lock box (Synchronization.Mutex needs macOS 15).
+final class Mutex<Value>: @unchecked Sendable {
+    private var value: Value
+    private let lock = NSLock()
+    init(_ value: Value) { self.value = value }
+    func withLock<R>(_ body: (inout Value) -> R) -> R {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(&value)
+    }
+}
+
 public enum SystemPolicy {
     // MARK: - Reading
 
@@ -58,7 +70,25 @@ public enum SystemPolicy {
     }
 
     /// Privacy-protected locations inside the home folder (TCC / App Sandbox).
+    /// Privacy-protected locations (cached per home folder — this is called for
+    /// every candidate file and every visible row, so it must be cheap).
     public static func protectedLocations(home: String) -> [ProtectedLocation] {
+        cache.withLock { cached in
+            if let hit = cached[home] { return hit.locations }
+            let locations = buildProtectedLocations(home: home)
+            cached[home] = CachedLocations(locations: locations, paths: Set(locations.map(\.path)))
+            return locations
+        }
+    }
+
+    private struct CachedLocations: Sendable {
+        let locations: [ProtectedLocation]
+        let paths: Set<String>
+    }
+
+    private static let cache = Mutex([String: CachedLocations]())
+
+    private static func buildProtectedLocations(home: String) -> [ProtectedLocation] {
         let lib = home + "/Library"
         func guided(_ headline: String, _ explanation: String, _ commands: [GuidedCommand] = [], app: String? = nil) -> GuidedRemediation {
             GuidedRemediation(headline: headline, explanation: explanation, commands: commands, applicationBundleID: app)
@@ -145,7 +175,8 @@ public enum SystemPolicy {
 
     /// Exact directory paths the scanner must never open (protected locations).
     public static func neverEnterPaths(home: String) -> Set<String> {
-        Set(protectedLocations(home: home).map(\.path))
+        _ = protectedLocations(home: home)
+        return cache.withLock { $0[home]?.paths ?? [] }
     }
 
     /// Whether a directory with this name is a protected package (e.g. "Photos Library.photoslibrary").
@@ -156,7 +187,19 @@ public enum SystemPolicy {
 
     /// The protected location containing (or equal to) `path`, if any.
     public static func protectedLocation(containing path: String, home: String) -> ProtectedLocation? {
-        protectedLocations(home: home).first { path == $0.path || path.hasPrefix($0.path + "/") }
+        // Fast path: anything outside ~/Library, ~/.Trash and ~/Pictures can't match.
+        guard path.hasPrefix(home + "/Library") || path.hasPrefix(home + "/.Trash") || path.hasPrefix(home + "/Pictures") else {
+            return nil
+        }
+        let paths = neverEnterPaths(home: home)
+        var candidate = path
+        while candidate.count > home.count {
+            if paths.contains(candidate) {
+                return protectedLocations(home: home).first { $0.path == candidate }
+            }
+            candidate = (candidate as NSString).deletingLastPathComponent
+        }
+        return nil
     }
 
     // MARK: - Modifying
@@ -184,16 +227,6 @@ public enum SystemPolicy {
         if components.contains(where: { isProtectedPackage(name: String($0)) }) { return false }
         return true
     }
-
-    /// iCloud Drive / File Provider locations — deleting here deletes everywhere.
-    public static func isCloudSynced(_ path: String, home: String) -> Bool {
-        let normalized = normalize(path)
-        return normalized.hasPrefix(home + "/Library/Mobile Documents/") || normalized.hasPrefix(home + "/Library/CloudStorage/")
-    }
-
-    /// Deletes at least this large require an explicit acknowledgement.
-    public static let largeDeleteBytes: UInt64 = 10_000_000_000
-    public static let largeDeleteItems: UInt64 = 50_000
 
     /// Lexical normalization: strips trailing slashes and "." components.
     public static func normalize(_ path: String) -> String {

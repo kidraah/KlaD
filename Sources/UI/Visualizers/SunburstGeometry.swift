@@ -75,7 +75,6 @@ final class SunburstGeometry: @unchecked Sendable {
     let identity = UUID()
 
     init(focus: FileTreeNode, measure: SizeMeasure,
-         colorMode: ColorMode = .category,
          maxRings: Int = SunburstGeometry.defaultMaxRings,
          minAngle: Double = SunburstGeometry.defaultMinAngle) {
         self.focus = focus
@@ -125,7 +124,7 @@ final class SunburstGeometry: @unchecked Sendable {
                         ring: ring,
                         start: a0,
                         end: a1,
-                        color: VisualizerPalette.color(for: child, depth: ring, siblingIndex: sibling, mode: colorMode),
+                        color: VisualizerPalette.color(for: child, depth: ring, siblingIndex: sibling),
                         value: v,
                         aggregateCount: 0,
                         parent: item.index,

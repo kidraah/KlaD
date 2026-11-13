@@ -51,7 +51,7 @@ public enum ScannerDiagnostics {
         var rows: [AttributeVerificationReport.Row] = []
         var privateReturned = 0
         let prefix = directory.hasSuffix("/") ? directory : directory + "/"
-        _ = reader.read(path: directory, isCancelled: { false }) { entry in
+        _ = reader.read(path: directory, isCancelled: { false }) { entry, _ in
             let name = entry.name
             var st = stat()
             var mismatches: [String] = []

@@ -51,55 +51,6 @@ extension SafetyLevel {
     }
 }
 
-/// "Colour by age" buckets — warm for recent activity, cool for old.
-enum AgeBucket: Int, CaseIterable, Identifiable {
-    case month, halfYear, year, twoYears, fiveYears, older
-
-    var id: Int { rawValue }
-
-    static func bucket(for newest: Int64, now: Date = Date()) -> AgeBucket {
-        let days = (now.timeIntervalSince1970 - Double(newest)) / 86_400
-        switch days {
-        case ..<31: return .month
-        case ..<183: return .halfYear
-        case ..<366: return .year
-        case ..<731: return .twoYears
-        case ..<1827: return .fiveYears
-        default: return .older
-        }
-    }
-
-    var title: String {
-        switch self {
-        case .month: return "This month"
-        case .halfYear: return "1–6 months"
-        case .year: return "6–12 months"
-        case .twoYears: return "1–2 years"
-        case .fiveYears: return "2–5 years"
-        case .older: return "Older"
-        }
-    }
-
-    var nsColor: NSColor {
-        switch self {
-        case .month: return .systemRed
-        case .halfYear: return .systemOrange
-        case .year: return .systemYellow
-        case .twoYears: return .systemGreen
-        case .fiveYears: return .systemTeal
-        case .older: return .systemBlue
-        }
-    }
-
-    var color: Color { Color(nsColor: nsColor) }
-}
-
-enum ColorMode: String, CaseIterable, Identifiable {
-    case category, age
-    var id: String { rawValue }
-    var title: String { self == .category ? "Category" : "Age" }
-}
-
 // MARK: - Formatting (nonisolated: also used inside Canvas renderers)
 
 /// Finder-style decimal sizes ("12.4 GB").
@@ -112,8 +63,16 @@ func formatSignedBytes(_ delta: Int64) -> String {
     return delta > 0 ? "+" + magnitude : (delta < 0 ? "−" + magnitude : magnitude)
 }
 
+/// Always English compact counts: 950, 12.4K, 2.48M (never lakh/crore).
+private let englishLocale = Locale(identifier: "en_US_POSIX")
+
 func formatCount(_ value: UInt64) -> String {
-    value.formatted(.number.notation(.compactName))
+    value.formatted(.number.notation(.compactName).precision(.significantDigits(1...3)).locale(englishLocale))
+}
+
+/// Full count with English grouping: 2,205,489.
+func formatInteger<T: BinaryInteger>(_ value: T) -> String {
+    Int64(clamping: value).formatted(.number.grouping(.automatic).locale(Locale(identifier: "en_US")))
 }
 
 /// "~/Library/Caches" for paths under the home folder.
@@ -136,10 +95,10 @@ enum FileIcons {
         if node.isProtectedLocation { return symbol("lock.fill") }
         if node.parent == nil { return volumeOrFolderIcon(path: node.path) }
         if node.isDirectory {
-            // Bundles and special folders: real icon (reads bundle metadata only).
-            if node.flags.contains(.package) || node.parent?.parent == nil || node.depth <= 2 {
-                return pathIcon(node.path)
-            }
+            // App bundles and the home folder's special folders get their real
+            // icon; everything else uses the generic folder (no file access).
+            if node.flags.contains(.package) && node.name.hasSuffix(".app") { return pathIcon(node.path) }
+            if specialFolderNames.contains(node.name), node.parent?.path == NSHomeDirectory() { return pathIcon(node.path) }
             return typeIcon(.folder)
         }
         if node.flags.contains(.cloudPlaceholder) { return symbol("icloud") }
@@ -153,6 +112,10 @@ enum FileIcons {
         let ext = (path as NSString).pathExtension.lowercased()
         return typeIcon(ext.isEmpty ? .data : (UTType(filenameExtension: ext) ?? .data))
     }
+
+    private static let specialFolderNames: Set<String> = [
+        "Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures", "Public", "Applications", "Library",
+    ]
 
     static func typeIcon(_ type: UTType) -> NSImage {
         let key = "type:" + type.identifier
@@ -202,28 +165,6 @@ enum SystemActions {
         if let url = URL(string: "x-apple.systempreferences:com.apple.settings.Storage") {
             NSWorkspace.shared.open(url)
         }
-    }
-
-    /// Bundle ids + names of installed apps (LaunchServices-visible locations).
-    static func installedApps() -> InstalledApps {
-        var ids = Set<String>()
-        var names = Set<String>()
-        let roots = ["/Applications", "/Applications/Utilities", "/System/Applications", "/System/Applications/Utilities",
-                     NSHomeDirectory() + "/Applications"]
-        for root in roots {
-            guard let items = try? FileManager.default.contentsOfDirectory(atPath: root) else { continue }
-            for item in items where item.hasSuffix(".app") {
-                names.insert(String(item.dropLast(4)).lowercased())
-                if let bundle = Bundle(path: root + "/" + item), let id = bundle.bundleIdentifier {
-                    ids.insert(id.lowercased())
-                }
-            }
-        }
-        for app in NSWorkspace.shared.runningApplications {
-            if let id = app.bundleIdentifier { ids.insert(id.lowercased()) }
-            if let name = app.localizedName { names.insert(name.lowercased()) }
-        }
-        return InstalledApps(bundleIDs: ids, names: names)
     }
 }
 

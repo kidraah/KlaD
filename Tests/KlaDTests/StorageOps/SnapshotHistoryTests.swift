@@ -269,60 +269,9 @@ struct SnapshotHistoryTests {
                           availableForOpportunisticUsage: available)
     }
 
-    @Test func sizeSeriesIsOldestFirstAndSkipsSnapshotsWithoutThePath() async throws {
-        let scratch = try ScratchDir("hist"); defer { scratch.cleanup() }
-        let service = try makeService(scratch)
-        // Saved out of chronological order on purpose.
-        try await service.save(snapshot(completed: 300, entries: [entry("/r", 0, 9 * GB), entry("/r/cache", 1, 3 * GB)]))
-        try await service.save(snapshot(completed: 100, entries: [entry("/r", 0, 5 * GB), entry("/r/cache", 1, GB)]))
-        try await service.save(snapshot(completed: 200, entries: [entry("/r", 0, 7 * GB)]))   // no /r/cache that day
-        try await service.save(snapshot(root: "/other", completed: 250, entries: [entry("/other", 0, GB), entry("/r/cache", 1, 2 * GB)]))
 
-        let series = try await service.sizeSeries(path: "/r/cache")
-        #expect(series.map(\.date.timeIntervalSince1970) == [100, 250, 300])
-        #expect(series.map(\.metrics.allocatedBytes) == [GB, 2 * GB, 3 * GB])
-        #expect(series[0].metrics == metrics(GB))
-        #expect(try await service.sizeSeries(path: "/r").map(\.metrics.allocatedBytes) == [5 * GB, 7 * GB, 9 * GB])
-        #expect(try await service.sizeSeries(path: "/nope").isEmpty)
-    }
 
-    @Test func usageSeriesDecodesVolumeReportsOldestFirst() async throws {
-        let scratch = try ScratchDir("hist"); defer { scratch.cleanup() }
-        let service = try makeService(scratch)
-        let total: UInt64 = 1000 * GB
-        try await service.save(snapshot(completed: 300, entries: [entry("/r", 0, GB)], volume: volume(total: total, available: 400 * GB)))
-        try await service.save(snapshot(completed: 100, entries: [entry("/r", 0, GB)], volume: volume(total: total, available: 600 * GB)))
-        try await service.save(snapshot(completed: 200, entries: [entry("/r", 0, GB)]))           // no volume report ⇒ skipped
-        try await service.save(snapshot(root: "/other", completed: 250, entries: [entry("/other", 0, GB)],
-                                        volume: volume(total: total, available: 500 * GB)))        // any root counts
 
-        let usage = try await service.usageSeries()
-        #expect(usage.map(\.date.timeIntervalSince1970) == [100, 250, 300])
-        #expect(usage.map(\.usedBytes) == [400 * GB, 500 * GB, 600 * GB])
-        #expect(usage.allSatisfy { $0.totalBytes == total })
-    }
-
-    @Test func usageSeriesDeduplicatesByTimestampAndClampsUsed() async throws {
-        let scratch = try ScratchDir("hist"); defer { scratch.cleanup() }
-        let service = try makeService(scratch)
-        let total: UInt64 = 1000 * GB
-        try await service.save(snapshot(completed: 100, entries: [entry("/r", 0, GB)], volume: volume(total: total, available: 600 * GB)))
-        try await service.save(snapshot(root: "/other", completed: 100, entries: [entry("/other", 0, GB)],
-                                        volume: volume(total: total, available: 590 * GB)))
-        // available > total (reported mid-purge) must not underflow.
-        try await service.save(snapshot(completed: 200, entries: [entry("/r", 0, GB)], volume: volume(total: total, available: total + GB)))
-        let usage = try await service.usageSeries()
-        #expect(usage.count == 2)
-        #expect(usage[0].date.timeIntervalSince1970 == 100)
-        #expect(usage[1].usedBytes == 0)
-    }
-
-    @Test func seriesProtocolConformance() async throws {
-        let scratch = try ScratchDir("hist"); defer { scratch.cleanup() }
-        let provider: any SnapshotSeriesProviding = try makeService(scratch)
-        #expect(try await provider.usageSeries().isEmpty)
-        #expect(try await provider.sizeSeries(path: "/x").isEmpty)
-    }
 
     // MARK: Schema migration
 
@@ -384,14 +333,11 @@ struct SnapshotHistoryTests {
         let summaries = try await service.summaries(rootPath: nil)
         #expect(summaries.count == 1)
         #expect(summaries.first?.totals.allocatedBytes == 20)
-        let series = try await service.sizeSeries(path: "/r")
-        #expect(series.count == 1 && series[0].metrics.allocatedBytes == 20 && series[0].date.timeIntervalSince1970 == 100)
-        #expect(try await service.usageSeries().isEmpty)   // v1 row had no volume report
 
         // New writes work, and re-opening an already-upgraded database is a no-op.
         try await service.save(snapshot(completed: 500, entries: [entry("/r", 0, GB)]))
         let reopened = try SnapshotHistoryService(databaseURL: dbURL)
-        #expect(try await reopened.sizeSeries(path: "/r").count == 2)
+        #expect(try await reopened.summaries(rootPath: nil).count == 2)
         #expect(sqliteScalar(dbURL, "PRAGMA user_version") == "2")
     }
 

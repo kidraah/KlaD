@@ -14,24 +14,24 @@ struct SunburstCanvasView: View {
 
     @State private var geometry: SunburstGeometry?
     @State private var hovered: SunburstGeometry.Hit?
+    @State private var animating = false
     @State private var transition = ZoomTransition<PolarTransform>(from: .identity, start: .distantPast)
 
     private struct Key: Equatable {
         let focus: ObjectIdentifier?
         let measure: SizeMeasure
-        let mode: ColorMode
         let version: Int
     }
 
     private var key: Key {
-        Key(focus: app.focus.map(ObjectIdentifier.init), measure: app.measure, mode: app.colorMode, version: app.treeVersion)
+        Key(focus: app.focus.map(ObjectIdentifier.init), measure: app.measure, version: app.treeVersion)
     }
 
     var body: some View {
         GeometryReader { proxy in
             ZStack {
                 if let geometry {
-                    SunburstBaseLayer(geometry: geometry, transition: transition)
+                    SunburstBaseLayer(geometry: geometry, transition: transition, animating: animating)
                         .equatable()
                     SunburstOverlayLayer(
                         geometry: geometry,
@@ -62,6 +62,11 @@ struct SunburstCanvasView: View {
             .accessibilityValue(app.focus.map { formatBytes($0.metrics.value(for: app.measure)) } ?? "")
         }
         .onAppear { rebuild(animated: false) }
+        .task(id: transition.start) {
+            guard animating else { return }
+            try? await Task.sleep(for: .seconds(ZoomTransition<PolarTransform>.duration + 0.05))
+            animating = false
+        }
         .onChange(of: key) { _, _ in rebuild(animated: !reduceMotion) }
     }
 
@@ -109,7 +114,7 @@ struct SunburstCanvasView: View {
             return
         }
         let old = geometry
-        let new = SunburstGeometry(focus: focus, measure: app.measure, colorMode: app.colorMode)
+        let new = SunburstGeometry(focus: focus, measure: app.measure)
         var from = PolarTransform.identity
         if animated, let old, old.measure == new.measure, old.focus !== focus {
             if let index = old.index(of: focus) {
@@ -123,6 +128,7 @@ struct SunburstCanvasView: View {
         geometry = new
         hovered = nil
         transition = ZoomTransition(from: from, start: from == .identity ? .distantPast : Date())
+        animating = from != .identity
     }
 
     // MARK: Center readout
@@ -191,13 +197,15 @@ struct ZoomTransition<T: Equatable & Sendable>: Equatable, Sendable {
 private struct SunburstBaseLayer: View, Equatable {
     let geometry: SunburstGeometry
     let transition: ZoomTransition<PolarTransform>
+    /// The animation clock only ticks while a zoom is running.
+    let animating: Bool
 
     nonisolated static func == (lhs: SunburstBaseLayer, rhs: SunburstBaseLayer) -> Bool {
-        lhs.geometry === rhs.geometry && lhs.transition == rhs.transition
+        lhs.geometry === rhs.geometry && lhs.transition == rhs.transition && lhs.animating == rhs.animating
     }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: nil, paused: !transition.isRunning(at: Date()))) { timeline in
+        TimelineView(.animation(minimumInterval: nil, paused: !animating)) { timeline in
             let t = transition.progress(at: timeline.date)
             let transform = transition.from.interpolated(to: .identity, t)
             Canvas { context, size in

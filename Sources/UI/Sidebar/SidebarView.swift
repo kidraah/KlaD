@@ -21,7 +21,7 @@ struct SidebarView: View {
                     }
                     .tag(SidebarItem.location(location.path))
                     .contextMenu {
-                        Button("Rescan") { app.open(location, forceRescan: true) }
+                        Button("Rescan") { app.open(location) }
                         if location.path != "/" {
                             Button("Show in Finder") { SystemActions.reveal(location.path) }
                         }
@@ -79,7 +79,6 @@ struct SidebarView: View {
     private func badge(for section: InsightSection) -> Int {
         switch section {
         case .recommendations: return app.recommendations(for: .safeToClear).count
-        case .similarFolders: return app.similarFolders.count
         case .duplicates: return app.duplicateGroups.count
         default: return 0
         }
@@ -143,7 +142,6 @@ struct ScanningView: View {
     private var title: String {
         let name = app.currentLocation?.title ?? "Location"
         switch app.phase {
-        case .loading: return "Opening “\(name)”…"
         case .analyzing: return "Analyzing “\(name)”…"
         default: return "Scanning “\(name)”…"
         }

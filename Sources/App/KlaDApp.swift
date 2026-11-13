@@ -4,15 +4,11 @@ import AppKit
 import SwiftUI
 import KlaDModels
 import KlaDScanner
-import KlaDStorageOps
 
 @main
 struct KlaDApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @State private var app = AppState(
-        cache: try? ScanCacheStore(directory: ScanCacheStore.defaultDirectory()),
-        forecaster: StorageForecaster()
-    )
+    @State private var app = AppState()
 
     var body: some Scene {
         WindowGroup("KlaD", id: "main") {
@@ -40,14 +36,15 @@ struct KlaDApp: App {
                     .disabled(app.currentLocation == nil || app.isBusy)
             }
             CommandGroup(after: .toolbar) {
+                Picker("Appearance", selection: $app.appearance) {
+                    ForEach(AppAppearance.allCases) { Text($0.title).tag($0) }
+                }
+                Divider()
                 Picker("Chart", selection: $app.visualizerMode) {
                     ForEach(VisualizerMode.allCases) { Text($0.title).tag($0) }
                 }
                 Picker("Size By", selection: $app.measure) {
                     ForEach(SizeMeasure.allCases) { Text($0.displayName).tag($0) }
-                }
-                Picker("Color By", selection: $app.colorMode) {
-                    ForEach(ColorMode.allCases) { Text($0.title).tag($0) }
                 }
                 Button("Zoom Out") { app.drillUp() }
                     .keyboardShortcut(.upArrow, modifiers: .command)

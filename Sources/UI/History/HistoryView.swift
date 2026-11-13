@@ -1,6 +1,5 @@
-// HistoryView.swift — used space over time, forecast, what changed, live updates.
+// HistoryView.swift — what changed between scans, and live updates.
 
-import Charts
 import SwiftUI
 import KlaDModels
 
@@ -10,35 +9,6 @@ struct HistoryView: View {
     var body: some View {
         @Bindable var app = app
         Form {
-            Section {
-                if app.usageSeries.count >= 2 {
-                    Chart(app.usageSeries, id: \.date) { sample in
-                        AreaMark(x: .value("Date", sample.date), y: .value("Used", Double(sample.usedBytes)))
-                            .foregroundStyle(Color.accentColor.opacity(0.18))
-                            .interpolationMethod(.monotone)
-                        LineMark(x: .value("Date", sample.date), y: .value("Used", Double(sample.usedBytes)))
-                            .foregroundStyle(Color.accentColor)
-                            .interpolationMethod(.monotone)
-                    }
-                    .chartYAxis {
-                        AxisMarks(position: .leading) { value in
-                            AxisGridLine()
-                            AxisValueLabel { if let v = value.as(Double.self) { Text(formatBytes(UInt64(max(0, v)))) } }
-                        }
-                    }
-                    .frame(height: 180)
-                    .padding(.vertical, 4)
-                } else {
-                    Text("Scan again over the coming days to see how used space changes.")
-                        .foregroundStyle(.secondary)
-                }
-                if let forecast = app.forecast {
-                    Label(forecastText(forecast), systemImage: "calendar")
-                }
-            } header: {
-                Text("Used Space")
-            }
-
             Section {
                 if app.snapshots.count >= 2 {
                     Picker("Compare with", selection: Binding(
@@ -71,7 +41,7 @@ struct HistoryView: View {
                         .contentShape(Rectangle())
                         .contextMenu { PathContextMenu(path: change.path) }
                     }
-                } else if app.snapshots.count < 2 {
+                } else {
                     Text("Every scan is saved. Scan this location again later to see what changed.")
                         .foregroundStyle(.secondary)
                 }
@@ -112,18 +82,5 @@ struct HistoryView: View {
         }
         .formStyle(.grouped)
         .task { await app.reloadHistory() }
-    }
-
-    private func forecastText(_ forecast: ForecastOutcome) -> String {
-        switch forecast {
-        case .insufficientData:
-            return "A fill forecast appears after a week of scans on at least four different days."
-        case .notFillingUp:
-            return "Used space isn't growing."
-        case .fillsIn(let low, let high, let perDay):
-            return "At about \(formatBytes(UInt64(max(0, perDay)))) a day, the disk would be full in \(low)–\(high) days."
-        case .moreThanTwoYears:
-            return "At the current pace, the disk won't fill up for more than two years."
-        }
     }
 }

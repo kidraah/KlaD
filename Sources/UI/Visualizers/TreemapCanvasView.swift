@@ -9,12 +9,12 @@ struct TreemapCanvasView: View {
 
     @State private var geometry: TreemapGeometry?
     @State private var hovered: Int?
+    @State private var animating = false
     @State private var transition = ZoomTransition<AffineBox>(from: AffineBox(.identity), start: .distantPast)
 
     private struct Key: Equatable {
         let focus: ObjectIdentifier?
         let measure: SizeMeasure
-        let mode: ColorMode
         let version: Int
         let width: Int
         let height: Int
@@ -22,11 +22,11 @@ struct TreemapCanvasView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let key = Key(focus: app.focus.map(ObjectIdentifier.init), measure: app.measure, mode: app.colorMode,
+            let key = Key(focus: app.focus.map(ObjectIdentifier.init), measure: app.measure,
                           version: app.treeVersion, width: Int(proxy.size.width), height: Int(proxy.size.height))
             ZStack(alignment: .topLeading) {
                 if let geometry {
-                    TreemapBaseLayer(geometry: geometry, transition: transition)
+                    TreemapBaseLayer(geometry: geometry, transition: transition, animating: animating)
                         .equatable()
                     TreemapOverlayLayer(geometry: geometry, hovered: hovered,
                                         selected: app.selection.flatMap { geometry.index(of: $0) })
@@ -50,8 +50,13 @@ struct TreemapCanvasView: View {
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Treemap of \(app.focus?.displayName ?? "")")
             .onAppear { rebuild(size: proxy.size, animated: false) }
+            .task(id: transition.start) {
+                guard animating else { return }
+                try? await Task.sleep(for: .seconds(ZoomTransition<AffineBox>.duration + 0.05))
+                animating = false
+            }
             .onChange(of: key) { old, new in
-                let resizedOnly = old.focus == new.focus && old.measure == new.measure && old.version == new.version && old.mode == new.mode
+                let resizedOnly = old.focus == new.focus && old.measure == new.measure && old.version == new.version
                 rebuild(size: proxy.size, animated: !resizedOnly && !reduceMotion)
             }
         }
@@ -92,7 +97,12 @@ struct TreemapCanvasView: View {
             return
         }
         let old = geometry
-        let new = TreemapGeometry(focus: focus, measure: app.measure, size: size, colorMode: app.colorMode)
+        let new = TreemapGeometry(focus: focus, measure: app.measure, size: size)
+        for index in new.iconCandidates.prefix(150) {
+            if let node = new.tiles[index].node {
+                new.icons[index] = Image(nsImage: FileIcons.icon(for: node))
+            }
+        }
         var from = CGAffineTransform.identity
         let bounds = CGRect(origin: .zero, size: size)
         if animated, let old, old.focus !== focus, old.measure == new.measure {
@@ -105,6 +115,7 @@ struct TreemapCanvasView: View {
         geometry = new
         hovered = nil
         transition = ZoomTransition(from: AffineBox(from), start: from.isIdentity ? .distantPast : Date())
+        animating = !from.isIdentity
     }
 
     static func transform(mapping source: CGRect, to target: CGRect) -> CGAffineTransform {
@@ -131,13 +142,15 @@ struct AffineBox: Equatable, Sendable {
 private struct TreemapBaseLayer: View, Equatable {
     let geometry: TreemapGeometry
     let transition: ZoomTransition<AffineBox>
+    /// The animation clock only ticks while a zoom is running.
+    let animating: Bool
 
     nonisolated static func == (lhs: TreemapBaseLayer, rhs: TreemapBaseLayer) -> Bool {
-        lhs.geometry === rhs.geometry && lhs.transition == rhs.transition
+        lhs.geometry === rhs.geometry && lhs.transition == rhs.transition && lhs.animating == rhs.animating
     }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: nil, paused: !transition.isRunning(at: Date()))) { timeline in
+        TimelineView(.animation(minimumInterval: nil, paused: !animating)) { timeline in
             let p = transition.progress(at: timeline.date)
             Canvas { context, size in
                 context.clip(to: Path(CGRect(origin: .zero, size: size)))

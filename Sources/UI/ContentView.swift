@@ -22,23 +22,18 @@ struct ContentView: View {
         .navigationTitle(app.currentLocation?.title ?? "KlaD")
         .navigationSubtitle(subtitle)
         .toolbar { MainToolbar() }
-        .searchable(text: $app.searchText, placement: .toolbar, prompt: "Search")
         .sheet(item: $app.cleanupRequest) { request in
             CleanupSheet(request: request)
         }
-        .sheet(item: $app.batchRequest) { request in
-            BatchCleanupSheet(request: request)
-        }
         .task {
+            app.appearance.apply()
             LaunchOptions.applyAppearance()
-            if let tab = LaunchOptions.section { app.sidebarSelection = .section(tab) }
+            if let section = LaunchOptions.section { app.sidebarSelection = .section(section) }
             if let mode = LaunchOptions.mode { app.visualizerMode = mode }
             if let path = LaunchOptions.scanPath {
                 let location = path == "/" ? ScanLocation.disk
                     : (path == NSHomeDirectory() ? ScanLocation.home : app.addLocation(path: path))
-                app.open(location, forceRescan: LaunchOptions.forceRescan)
-            } else {
-                await app.restoreLastSession()
+                app.open(location)
             }
         }
     }
@@ -47,11 +42,9 @@ struct ContentView: View {
         switch app.phase {
         case .scanning: return "Scanning…"
         case .analyzing: return "Analyzing…"
-        case .loading: return "Opening…"
         default:
-            guard let scannedAt = app.scannedAt, let root = app.root else { return "" }
-            let age = Date().timeIntervalSince(scannedAt) < 90 ? "Scanned just now" : "Scanned \(relativeDate(scannedAt))"
-            return "\(age) · \(formatCount(root.metrics.itemCount)) items"
+            guard app.scannedAt != nil, let root = app.root else { return "" }
+            return "\(formatCount(root.metrics.itemCount)) items · \(formatBytes(root.metrics.allocatedBytes))"
         }
     }
 }
@@ -66,7 +59,7 @@ struct DetailView: View {
             switch app.phase {
             case .idle where app.root == nil:
                 WelcomeView()
-            case .scanning, .analyzing, .loading:
+            case .scanning, .analyzing:
                 ScanningView()
             case .failed(let message):
                 ContentUnavailableView {
@@ -77,28 +70,15 @@ struct DetailView: View {
                     Button("Choose Another Location") { app.phase = .idle }
                 }
             default:
-                if !app.searchText.trimmingCharacters(in: .whitespaces).isEmpty {
-                    SearchResultsView()
-                } else {
-                    sectionView
+                switch app.section {
+                case .overview: OverviewView()
+                case .recommendations: RecommendationsView()
+                case .duplicates: DuplicatesView()
+                case .history: HistoryView()
                 }
             }
         }
         .frame(minWidth: 520, minHeight: 420)
-    }
-
-    @ViewBuilder
-    private var sectionView: some View {
-        switch app.section {
-        case .overview: OverviewView()
-        case .recommendations: RecommendationsView()
-        case .largestFiles: LargestFilesView()
-        case .fileTypes: FileTypesView()
-        case .similarFolders: SimilarFoldersView()
-        case .duplicates: DuplicatesView()
-        case .whereIsMySpace: WhereIsMySpaceView()
-        case .history: HistoryView()
-        }
     }
 }
 
@@ -109,7 +89,7 @@ struct MainToolbar: ToolbarContent {
 
     var body: some ToolbarContent {
         @Bindable var app = app
-        if app.section == .overview && app.hasResults && app.searchText.isEmpty {
+        if app.section == .overview && app.hasResults {
             ToolbarItem(placement: .principal) {
                 Picker("Chart", selection: $app.visualizerMode) {
                     ForEach(VisualizerMode.allCases) { mode in
@@ -124,13 +104,10 @@ struct MainToolbar: ToolbarContent {
                     Picker("Size By", selection: $app.measure) {
                         ForEach(SizeMeasure.allCases) { Text($0.displayName).tag($0) }
                     }
-                    Picker("Color By", selection: $app.colorMode) {
-                        ForEach(ColorMode.allCases) { Text($0.title).tag($0) }
-                    }
                 } label: {
-                    Label("View Options", systemImage: "slider.horizontal.3")
+                    Label("Size By", systemImage: "slider.horizontal.3")
                 }
-                .help("Size and color options")
+                .help("What sizes the chart")
             }
         }
         ToolbarItem(placement: .primaryAction) {
@@ -173,14 +150,12 @@ enum LaunchOptions {
 
     /// `--scan <path>`
     static var scanPath: String? { value(after: "--scan").map { ($0 as NSString).expandingTildeInPath } }
-    /// `--rescan` forces a fresh scan instead of the cached one.
-    static var forceRescan: Bool { ProcessInfo.processInfo.arguments.contains("--rescan") }
-    /// `--section overview|recommendations|…`
+    /// `--section overview|recommendations|duplicates|history`
     static var section: InsightSection? { value(after: "--section").flatMap(InsightSection.init(rawValue:)) }
     /// `--mode sunburst|treemap`
     static var mode: VisualizerMode? { value(after: "--mode").flatMap(VisualizerMode.init(rawValue:)) }
 
-    /// `--appearance light|dark` — testing aid; normally KlaD follows the system.
+    /// `--appearance light|dark` — testing aid; overrides the setting for this launch.
     @MainActor
     static func applyAppearance() {
         switch value(after: "--appearance") {

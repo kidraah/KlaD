@@ -10,7 +10,6 @@ struct CleanupSheet: View {
 
     @State private var report: PreflightReport?
     @State private var reviewed = false
-    @State private var acknowledged: Set<String> = []
     @State private var performing = false
     @State private var outcome: CleanupOutcome?
 
@@ -75,17 +74,9 @@ struct CleanupSheet: View {
                     }
                 }
 
-                if request.requiresReviewAcknowledgement || !(report?.acknowledgementsRequired.isEmpty ?? true) {
+                if request.requiresReviewAcknowledgement {
                     Section {
-                        if request.requiresReviewAcknowledgement {
-                            Toggle("I reviewed this item and don't need anything inside it", isOn: $reviewed)
-                        }
-                        ForEach(report?.acknowledgementsRequired ?? []) { check in
-                            Toggle(check.detail, isOn: Binding(
-                                get: { acknowledged.contains(check.id) },
-                                set: { if $0 { acknowledged.insert(check.id) } else { acknowledged.remove(check.id) } }
-                            ))
-                        }
+                        Toggle("I reviewed this item and don't need anything inside it", isOn: $reviewed)
                     }
                 }
 
@@ -125,8 +116,7 @@ struct CleanupSheet: View {
 
     private var canProceed: Bool {
         guard let report, report.canProceed, !performing, outcome?.succeeded != true else { return false }
-        if request.requiresReviewAcknowledgement && !reviewed { return false }
-        return report.acknowledgementsRequired.allSatisfy { acknowledged.contains($0.id) }
+        return !request.requiresReviewAcknowledgement || reviewed
     }
 
     private func perform() {
@@ -153,112 +143,6 @@ struct CleanupSheet: View {
         case .warning: return .orange
         case .failed: return .red
         case .skipped: return .secondary
-        }
-    }
-}
-
-// MARK: - Batch
-
-struct BatchCleanupSheet: View {
-    @Environment(AppState.self) private var app
-    @Environment(\.dismiss) private var dismiss
-    let request: BatchCleanupRequest
-
-    @State private var included: Set<String> = []
-    @State private var running = false
-    @State private var completed = 0
-    @State private var results: [BatchItemResult] = []
-
-    var body: some View {
-        VStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Move Safe Items to the Trash")
-                    .font(.headline)
-                Text("Every item is checked again first. Items that need your individual attention are skipped, never forced.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(20)
-
-            List {
-                if results.isEmpty {
-                    ForEach(request.items) { item in
-                        Toggle(isOn: Binding(
-                            get: { included.contains(item.id) },
-                            set: { if $0 { included.insert(item.id) } else { included.remove(item.id) } }
-                        )) {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(item.title)
-                                    Text(abbreviatePath(item.path)).font(.caption).foregroundStyle(.secondary)
-                                        .lineLimit(1).truncationMode(.middle)
-                                }
-                                Spacer()
-                                Text(formatBytes(item.reclaimableBytes)).monospacedDigit().foregroundStyle(.secondary)
-                            }
-                        }
-                        .disabled(running)
-                    }
-                } else {
-                    ForEach(results) { result in
-                        Label {
-                            HStack {
-                                Text(result.recommendation.title)
-                                Spacer()
-                                Text(result.detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                            }
-                        } icon: {
-                            Image(systemName: result.succeeded ? "checkmark.circle.fill" : "minus.circle")
-                                .foregroundStyle(result.succeeded ? .green : .secondary)
-                        }
-                    }
-                }
-            }
-            .listStyle(.inset(alternatesRowBackgrounds: true))
-
-            Divider()
-            HStack {
-                if running {
-                    ProgressView(value: Double(completed), total: Double(max(selectedItems.count, 1)))
-                        .frame(width: 180)
-                } else if !results.isEmpty {
-                    let moved = results.filter(\.succeeded).count
-                    Text("Moved \(moved) of \(results.count) items")
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("\(selectedItems.count) items · \(formatBytes(selectedItems.reduce(0) { $0 + $1.reclaimableBytes }))")
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
-                Spacer()
-                if results.isEmpty {
-                    Button("Cancel", role: .cancel) { dismiss() }
-                        .keyboardShortcut(.cancelAction)
-                        .disabled(running)
-                    Button("Move to Trash", role: .destructive) { run() }
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(running || selectedItems.isEmpty)
-                } else {
-                    Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
-                }
-            }
-            .padding(16)
-        }
-        .frame(width: 560, height: 560)
-        .onAppear { included = Set(request.items.map(\.id)) }
-    }
-
-    private var selectedItems: [CleanupRecommendation] {
-        request.items.filter { included.contains($0.id) }
-    }
-
-    private func run() {
-        running = true
-        let items = selectedItems
-        Task {
-            results = await app.performBatch(items) { index in completed = index }
-            running = false
         }
     }
 }

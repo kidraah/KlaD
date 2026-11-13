@@ -103,56 +103,15 @@ public final class DuplicateDetectorService: DuplicateDetecting {
         return groups
     }
 
-    // MARK: "Keep the original-looking copy"
-
-    /// Orders a group so the copy most likely to be the original comes first:
-    /// (1) not copy-named, (2) not in Downloads / Trash / a backup-or-old folder,
-    /// (3) oldest modification, (4) shortest path (then lexical, for determinism).
+    /// Keeps the oldest copy first (then the shortest path, for determinism).
     static func keepOrder(_ members: [DuplicateCandidate], home: String) -> [DuplicateCandidate] {
-        struct Key: Comparable {
-            var copyNamed: Bool
-            var lowPriorityLocation: Bool
-            var modified: Int64
-            var pathLength: Int
-            var path: String
-            static func < (a: Key, b: Key) -> Bool {
-                if a.copyNamed != b.copyNamed { return !a.copyNamed }
-                if a.lowPriorityLocation != b.lowPriorityLocation { return !a.lowPriorityLocation }
-                if a.modified != b.modified { return a.modified < b.modified }
-                if a.pathLength != b.pathLength { return a.pathLength < b.pathLength }
-                return a.path < b.path
-            }
+        members.sorted { a, b in
+            let ma = a.modificationTime > 0 ? a.modificationTime : Int64.max
+            let mb = b.modificationTime > 0 ? b.modificationTime : Int64.max
+            if ma != mb { return ma < mb }
+            if a.path.utf8.count != b.path.utf8.count { return a.path.utf8.count < b.path.utf8.count }
+            return a.path < b.path
         }
-        func key(_ c: DuplicateCandidate) -> Key {
-            Key(copyNamed: isCopyNamed(fileName: (c.path as NSString).lastPathComponent),
-                lowPriorityLocation: isInLowPriorityLocation(c.path, home: home),
-                modified: c.modificationTime > 0 ? c.modificationTime : Int64.max,
-                pathLength: c.path.utf8.count, path: c.path)
-        }
-        return members.map { (key($0), $0) }.sorted { $0.0 < $1.0 }.map(\.1)
-    }
-
-    /// "x copy.txt", "x copy 2.txt", "x (1).txt", "x-1.txt", "x 2.txt", "Copy of x.txt".
-    static func isCopyNamed(fileName: String) -> Bool {
-        let base = (fileName as NSString).deletingPathExtension.lowercased()
-        if base.hasPrefix("copy of ") { return true }
-        let range = NSRange(base.startIndex..., in: base)
-        return copyNamePattern.firstMatch(in: base, range: range) != nil
-    }
-
-    private static let copyNamePattern = try! NSRegularExpression(
-        pattern: #"( copy( \d+)?| \(\d+\)|[ \-]\d{1,2})$"#)
-
-    static func isInLowPriorityLocation(_ path: String, home: String) -> Bool {
-        let normalized = SystemPolicy.normalize(path)
-        if normalized.hasPrefix(home + "/Downloads/") { return true }
-        for folder in normalized.split(separator: "/").dropLast() {
-            let name = folder.lowercased()
-            if name == ".trash" || name == "trash" || name.contains("backup") { return true }
-            let words = name.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
-            if words.contains(where: { $0 == "old" || $0 == "bak" }) { return true }
-        }
-        return false
     }
 
     // MARK: Candidate filtering

@@ -38,12 +38,12 @@ struct SafeCleanupTests {
         let dir = try makeTarget(scratch)
         let report = await makeService(home: scratch.path).preflight(cleanupTarget(dir))
         #expect(report.checks.map(\.id) == [
-            "exists", "identity", "safety", "systemPolicy", "ownership", "runningApps", "openFiles", "cloudSynced", "largeDelete",
+            "exists", "identity", "safety", "systemPolicy", "ownership", "runningApps", "openFiles",
         ])
         #expect(report.checks.map(\.title) == [
             "Item still exists", "Same item as scanned", "Safety tier permits Trash",
             "Inside your home folder, outside protected data", "Owned by you, not locked by the system",
-            "Related apps are closed", "No open files inside", "Not synced with iCloud", "Size of this delete",
+            "Related apps are closed", "No open files inside",
         ])
         #expect(report.canProceed)
         #expect(report.checks.allSatisfy { $0.status == .passed }, "\(report.checks)")
@@ -59,7 +59,7 @@ struct SafeCleanupTests {
         #expect(check(report, "exists")?.status == .failed)
         #expect(check(report, "identity")?.status == .failed)
         #expect(!report.canProceed)
-        #expect(report.checks.count == 9)
+        #expect(report.checks.count == 7)
         #expect(check(report, "ownership")?.status == .failed)
     }
 
@@ -373,49 +373,7 @@ struct SafeCleanupTests {
         #expect(SafeCleanupService.ownershipCheck(stat: nil).status == .failed)
     }
 
-    @Test func cloudSyncedFoldersWarnAndRequireAcknowledgement() async throws {
-        let home = try ScratchDir("home"); defer { home.cleanup() }
-        let fm = FileManager.default
-        for root in ["Library/Mobile Documents/com~apple~CloudDocs/Project", "Library/CloudStorage/Dropbox/Project"] {
-            let path = home.path + "/" + root
-            try fm.createDirectory(atPath: path, withIntermediateDirectories: true)
-            let report = await makeService(home: home.path).preflight(cleanupTarget(path))
-            #expect(check(report, "systemPolicy")?.status == .passed, "\(root)")
-            let cloud = try #require(check(report, "cloudSynced"))
-            #expect(cloud.status == .warning)
-            #expect(cloud.requiresAcknowledgement)
-            #expect(cloud.detail == "Deleting here also deletes it from iCloud on all your devices.")
-            #expect(report.canProceed)
-            #expect(report.acknowledgementsRequired.map(\.id) == ["cloudSynced"])
-        }
-        // Ordinary folders are not flagged.
-        let plain = try makeTarget(home, name: "plain")
-        let report = await makeService(home: home.path).preflight(cleanupTarget(plain))
-        #expect(check(report, "cloudSynced")?.status == .passed)
-        #expect(check(report, "cloudSynced")?.requiresAcknowledgement == false)
-        #expect(report.acknowledgementsRequired.isEmpty)
-    }
 
-    @Test func largeDeletesRequireAcknowledgement() async throws {
-        let home = try ScratchDir("home"); defer { home.cleanup() }
-        let dir = try makeTarget(home)
-        let service = makeService(home: home.path)
-
-        var target = cleanupTarget(dir)
-        target.metrics = StorageMetrics(logicalBytes: 10_000_000_000, allocatedBytes: SystemPolicy.largeDeleteBytes, privateBytes: 1, fileCount: 3)
-        var large = try #require(check(await service.preflight(target), "largeDelete"))
-        #expect(large.status == .warning && large.requiresAcknowledgement)
-
-        target.metrics = StorageMetrics(allocatedBytes: 4096, privateBytes: 4096, fileCount: UInt32(SystemPolicy.largeDeleteItems - 10), directoryCount: 10)
-        large = try #require(check(await service.preflight(target), "largeDelete"))
-        #expect(large.status == .warning && large.requiresAcknowledgement, "item count threshold")
-
-        target.metrics = StorageMetrics(allocatedBytes: SystemPolicy.largeDeleteBytes - 1, fileCount: 1)
-        let small = try #require(check(await service.preflight(target), "largeDelete"))
-        #expect(small.status == .passed && !small.requiresAcknowledgement)
-        let report = await service.preflight(target)
-        #expect(report.canProceed && report.acknowledgementsRequired.isEmpty)
-    }
 
     @Test func moveToTrashRechecksPolicyAndOwnershipAgainstForgedReports() async throws {
         let home = try ScratchDir("home"); defer { home.cleanup() }

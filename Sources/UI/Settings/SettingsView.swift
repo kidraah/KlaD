@@ -23,7 +23,10 @@ private struct GeneralSettings: View {
     var body: some View {
         @Bindable var app = app
         Form {
-            Toggle("Show the last scan when KlaD opens", isOn: $app.reopenLastScan)
+            Picker("Appearance", selection: $app.appearance) {
+                ForEach(AppAppearance.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.segmented)
             Toggle("Update automatically when files change", isOn: $app.liveUpdates)
             Toggle("Use low priority for background updates", isOn: $app.gentleRescans)
             Picker("Keep scan history", selection: $app.historyLimit) {

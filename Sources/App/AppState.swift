@@ -1,10 +1,10 @@
 // AppState.swift — composition root & single source of truth.
 //
-// Threading follows the FileTreeNode contract: scan, classification, insights,
-// snapshot capture, duplicate-candidate collection and cache saving all run
-// off-main BEFORE publication. After publication the tree is mutated only here,
-// on the MainActor (cleanup removals and FSEvents-driven subtree splices), and
-// every mutation bumps `treeVersion`.
+// Threading follows the FileTreeNode contract: scan, classification, snapshot
+// capture and duplicate-candidate collection run off-main BEFORE publication.
+// After publication the tree is mutated only here, on the MainActor (cleanup
+// removals and FSEvents-driven subtree splices); every mutation bumps
+// `treeVersion`.
 
 import AppKit
 import Foundation
@@ -16,6 +16,29 @@ import KlaDScanner
 import KlaDStorageOps
 
 // MARK: - Navigation model
+
+/// Window appearance. Automatic follows the system (the default).
+enum AppAppearance: String, CaseIterable, Identifiable {
+    case automatic, light, dark
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .automatic: return "Automatic"
+        case .light: return "Light"
+        case .dark: return "Dark"
+        }
+    }
+
+    @MainActor
+    func apply() {
+        switch self {
+        case .automatic: NSApp?.appearance = nil
+        case .light: NSApp?.appearance = NSAppearance(named: .aqua)
+        case .dark: NSApp?.appearance = NSAppearance(named: .darkAqua)
+        }
+    }
+}
 
 struct ScanLocation: Identifiable, Hashable, Codable {
     var id: String { path }
@@ -30,7 +53,7 @@ struct ScanLocation: Identifiable, Hashable, Codable {
 }
 
 enum InsightSection: String, CaseIterable, Identifiable, Hashable {
-    case overview, recommendations, largestFiles, fileTypes, similarFolders, duplicates, whereIsMySpace, history
+    case overview, recommendations, duplicates, history
 
     var id: String { rawValue }
 
@@ -38,11 +61,7 @@ enum InsightSection: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .overview: return "Overview"
         case .recommendations: return "Recommendations"
-        case .largestFiles: return "Largest Files"
-        case .fileTypes: return "File Types"
-        case .similarFolders: return "Similar Folders"
         case .duplicates: return "Duplicates"
-        case .whereIsMySpace: return "Where Is My Space"
         case .history: return "History"
         }
     }
@@ -51,11 +70,7 @@ enum InsightSection: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .overview: return "chart.pie"
         case .recommendations: return "sparkles"
-        case .largestFiles: return "arrow.up.doc"
-        case .fileTypes: return "square.grid.2x2"
-        case .similarFolders: return "folder.badge.questionmark"
         case .duplicates: return "doc.on.doc"
-        case .whereIsMySpace: return "lock.shield"
         case .history: return "clock.arrow.circlepath"
         }
     }
@@ -70,22 +85,10 @@ struct CleanupRequest: Identifiable {
     let id = UUID()
     let target: CleanupTarget
     let recommendation: CleanupRecommendation?
-    /// Context ("Keeping …/original.mov", "Inside node_modules").
+    /// Context ("Identical to …", "Inside node_modules").
     let note: String?
 
     var requiresReviewAcknowledgement: Bool { target.safety.requiresExplicitReview }
-}
-
-struct BatchCleanupRequest: Identifiable {
-    let id = UUID()
-    let items: [CleanupRecommendation]
-}
-
-struct BatchItemResult: Identifiable {
-    var id: String { recommendation.id }
-    let recommendation: CleanupRecommendation
-    let succeeded: Bool
-    let detail: String
 }
 
 @MainActor
@@ -93,7 +96,6 @@ struct BatchItemResult: Identifiable {
 final class AppState {
     enum Phase: Equatable {
         case idle
-        case loading
         case scanning
         case analyzing
         case ready
@@ -109,7 +111,6 @@ final class AppState {
     var showInspector = true
     var visualizerMode: VisualizerMode = .sunburst
     var measure: SizeMeasure = .allocated
-    var colorMode: ColorMode = .category
 
     // MARK: Locations
     private(set) var customLocations: [ScanLocation] = []
@@ -124,30 +125,15 @@ final class AppState {
     var focus: FileTreeNode?
     var selection: FileTreeNode?
     private(set) var treeVersion = 0
-    /// When the published tree was scanned (older than now when restored from cache).
     private(set) var scannedAt: Date?
-    private(set) var restoredFromCache = false
     private var scanTask: Task<Void, Never>?
 
     // MARK: Volume
     private(set) var volume: VolumeSpaceReport?
 
-    // MARK: Insights
+    // MARK: Intelligence
     private(set) var recommendations: [CleanupRecommendation] = []
     private(set) var categoryTotals: [StorageCategory: StorageMetrics] = [:]
-    private(set) var largestFiles: [LargeFileEntry] = []
-    private(set) var fileTypes: [FileTypeSummary] = []
-    private(set) var similarFolders: [SimilarFolderGroup] = []
-    private(set) var protectedNodes: [FileTreeNode] = []
-    private(set) var opaqueNodes: [FileTreeNode] = []
-
-    // MARK: Search
-    var searchText = "" {
-        didSet { scheduleSearch() }
-    }
-    private(set) var searchResults: [FileTreeNode] = []
-    private(set) var isSearching = false
-    private var searchTask: Task<Void, Never>?
 
     // MARK: Duplicates
     private(set) var duplicateGroups: [DuplicateGroup] = []
@@ -162,10 +148,6 @@ final class AppState {
     private(set) var diff: SnapshotDiff?
     var diffBaseID: UUID?
     private(set) var historyError: String?
-    private(set) var usageSeries: [UsageSample] = []
-    private(set) var forecast: ForecastOutcome?
-    private(set) var folderSeries: [SizeSample] = []
-    private var folderSeriesPath: String?
 
     // MARK: Live updates
     private(set) var dirtyPaths: [DirtyPath] = []
@@ -177,7 +159,6 @@ final class AppState {
 
     // MARK: Cleanup
     var cleanupRequest: CleanupRequest?
-    var batchRequest: BatchCleanupRequest?
     private(set) var reclaimedThisSession: UInt64 = 0
 
     // MARK: Settings (persisted)
@@ -185,7 +166,7 @@ final class AppState {
     var gentleRescans: Bool { didSet { defaults.set(gentleRescans, forKey: "gentleRescans") } }
     var historyLimit: Int { didSet { defaults.set(historyLimit, forKey: "historyLimit") } }
     var excludedPaths: [String] { didSet { defaults.set(excludedPaths, forKey: "excludedPaths") } }
-    var reopenLastScan: Bool { didSet { defaults.set(reopenLastScan, forKey: "reopenLastScan") } }
+    var appearance: AppAppearance { didSet { defaults.set(appearance.rawValue, forKey: "appearance"); appearance.apply() } }
 
     // MARK: Services
     let scanner: any StorageScanning
@@ -196,11 +177,6 @@ final class AppState {
     let duplicates: any DuplicateDetecting
     let cleanup: any SafeCleanupPerforming
     let watcher: any FileSystemWatching
-    let cache: (any ScanCaching)?
-    let forecaster: (any StorageForecasting)?
-    let inventory: (any InventoryReporting)?
-    let similarDetector: (any SimilarFolderDetecting)?
-    let leftovers: (any LeftoverDetecting)?
 
     @ObservationIgnored private let defaults = UserDefaults.standard
 
@@ -212,12 +188,7 @@ final class AppState {
         history: (any SnapshotHistoryStoring)? = try? SnapshotHistoryService(databaseURL: SnapshotHistoryService.defaultDatabaseURL()),
         duplicates: any DuplicateDetecting = DuplicateDetectorService(),
         cleanup: any SafeCleanupPerforming = SafeCleanupService(),
-        watcher: any FileSystemWatching = FSEventsMonitor(),
-        cache: (any ScanCaching)? = nil,
-        forecaster: (any StorageForecasting)? = nil,
-        inventory: (any InventoryReporting)? = InventoryReporter(),
-        similarDetector: (any SimilarFolderDetecting)? = SimilarFolderDetector(),
-        leftovers: (any LeftoverDetecting)? = LeftoverDetector()
+        watcher: any FileSystemWatching = FSEventsMonitor()
     ) {
         self.scanner = scanner
         self.volumeInspector = volumeInspector
@@ -227,19 +198,14 @@ final class AppState {
         self.duplicates = duplicates
         self.cleanup = cleanup
         self.watcher = watcher
-        self.cache = cache
-        self.forecaster = forecaster
-        self.inventory = inventory
-        self.similarDetector = similarDetector
-        self.leftovers = leftovers
 
         let defaults = UserDefaults.standard
-        defaults.register(defaults: ["liveUpdates": true, "gentleRescans": true, "historyLimit": 60, "reopenLastScan": true])
+        defaults.register(defaults: ["liveUpdates": true, "gentleRescans": true, "historyLimit": 60])
         liveUpdates = defaults.bool(forKey: "liveUpdates")
         gentleRescans = defaults.bool(forKey: "gentleRescans")
         historyLimit = max(5, defaults.integer(forKey: "historyLimit"))
         excludedPaths = defaults.stringArray(forKey: "excludedPaths") ?? []
-        reopenLastScan = defaults.bool(forKey: "reopenLastScan")
+        appearance = AppAppearance(rawValue: defaults.string(forKey: "appearance") ?? "") ?? .automatic
         if let data = defaults.data(forKey: "customLocations"),
            let saved = try? JSONDecoder().decode([ScanLocation].self, from: data) {
             customLocations = saved
@@ -248,7 +214,7 @@ final class AppState {
 
     // MARK: - Derived
 
-    var isBusy: Bool { phase == .scanning || phase == .analyzing || phase == .loading }
+    var isBusy: Bool { phase == .scanning || phase == .analyzing }
     var hasResults: Bool { root != nil }
 
     func recommendations(for safety: SafetyLevel) -> [CleanupRecommendation] {
@@ -262,14 +228,6 @@ final class AppState {
     var focusChain: [FileTreeNode] {
         guard let focus else { return [] }
         return focus.ancestors + [focus]
-    }
-
-    /// Root metrics without opaque accounting nodes (what was actually enumerated).
-    var scannedMetrics: StorageMetrics {
-        guard let root else { return .zero }
-        var metrics = root.metrics
-        for node in opaqueNodes { metrics.subtract(node.aggregateContribution) }
-        return metrics
     }
 
     // MARK: - Locations
@@ -286,52 +244,23 @@ final class AppState {
     func removeLocation(_ location: ScanLocation) {
         customLocations.removeAll { $0 == location }
         persistLocations()
-        Task { try? await cache?.remove(rootPath: location.path) }
     }
 
     private func persistLocations() {
         if let data = try? JSONEncoder().encode(customLocations) { defaults.set(data, forKey: "customLocations") }
     }
 
-    /// Shows a location: instantly from the cached scan when available (then
-    /// catches up via FSEvents history), otherwise scans it.
-    func open(_ location: ScanLocation, forceRescan: Bool = false) {
+    func open(_ location: ScanLocation) {
         currentLocation = location
-        if !forceRescan, let cache {
-            cancelScan()
-            stopWatching()
-            phase = .loading
-            let resolvedPath = location.path == "/" ? "/" : (location.path as NSString).resolvingSymlinksInPath
-            scanTask = Task { [weak self] in
-                if let cached = try? await cache.load(rootPath: resolvedPath) {
-                    if Task.isCancelled { return }
-                    await self?.publishCached(cached.root, meta: cached.meta)
-                } else {
-                    if Task.isCancelled { return }
-                    self?.startScan(path: location.path)
-                }
-            }
-        } else {
-            startScan(path: location.path)
-        }
+        startScan(path: location.path)
     }
 
-    /// Restores the most recent cached scan at launch.
-    func restoreLastSession() async {
-        refreshVolume()
-        guard reopenLastScan, root == nil, phase == .idle, let cache else { return }
-        guard let latest = await cache.cachedScans().first else { return }
-        let location = locations.first { $0.path == latest.rootPath }
-            ?? ScanLocation(path: latest.rootPath, title: FileManager.default.displayName(atPath: latest.rootPath), symbol: "folder")
+    func rescan() {
+        guard let location = currentLocation else { return }
         open(location)
     }
 
     // MARK: - Scanning
-
-    func rescan() {
-        guard let location = currentLocation else { return }
-        open(location, forceRescan: true)
-    }
 
     func startScan(path: String) {
         cancelScan()
@@ -347,8 +276,8 @@ final class AppState {
 
         let scanner = self.scanner
         let inspector = self.volumeInspector
-        let eventID = watcher.currentEventID
         let options = ScanOptions(rootPath: path, excludedPaths: Set(excludedPaths))
+        let scanStart = ContinuousClock().now
 
         scanTask = Task { [weak self] in
             async let volumeReport = inspector.report(forPath: path)
@@ -362,17 +291,12 @@ final class AppState {
                 if Task.isCancelled { return }
                 guard let self else { return }
                 self.phase = .analyzing
-                let processed = await self.postProcess(scanResult.root, startedAt: scanResult.startedAt, completedAt: scanResult.completedAt)
-                if let cache = self.cache {
-                    let meta = ScanCacheMeta(rootPath: scanResult.root.path, scannedAt: scanResult.completedAt, fsEventsID: eventID,
-                                             privateSizeSupported: scanResult.privateSizeSupported,
-                                             unreadableCount: scanResult.unreadableCount,
-                                             nodeCount: Int(scanResult.root.metrics.itemCount) + 1)
-                    try? await cache.save(scanResult.root, meta: meta)   // reads the tree: must finish before publication
-                }
+                Trace.log("scan done (\(scanResult.root.metrics.itemCount) items)", since: scanStart)
+                let processed = await self.postProcess(scanResult)
                 let report = await volumeReport
                 if Task.isCancelled { return }
-                self.publish(scanResult, processed, volume: report, restored: false)
+                self.publish(scanResult, processed, volume: report)
+                Trace.log("ready", since: scanStart)
             } catch {
                 if Task.isCancelled { return }
                 self?.phase = .failed(error.localizedDescription)
@@ -393,12 +317,6 @@ final class AppState {
         selection = nil
         recommendations = []
         categoryTotals = [:]
-        largestFiles = []
-        fileTypes = []
-        similarFolders = []
-        protectedNodes = []
-        opaqueNodes = []
-        searchResults = []
         duplicateGroups = []
         duplicateCandidates = []
         duplicatesSearched = false
@@ -407,98 +325,61 @@ final class AppState {
         diff = nil
         diffBaseID = nil
         lastRescanSummary = nil
-        folderSeries = []
-        folderSeriesPath = nil
     }
 
     private struct PostProcessed: Sendable {
         let classification: ClassificationResult
-        let leftovers: [CleanupRecommendation]
-        let largest: [LargeFileEntry]
-        let types: [FileTypeSummary]
-        let similar: [SimilarFolderGroup]
         let snapshot: ScanSnapshot
         let candidates: [DuplicateCandidate]
-        let protectedPaths: [String]
     }
 
-    /// Everything that reads or annotates the tree, off-main, before publication.
-    private func postProcess(_ root: FileTreeNode, startedAt: Date, completedAt: Date) async -> PostProcessed {
+    /// Classification (the only writer) runs first, then the read-only passes in parallel.
+    private func postProcess(_ scanResult: ScanResult) async -> PostProcessed {
         let classifier = self.classifier
-        let inventory = self.inventory
-        let similarDetector = self.similarDetector
-        let leftovers = self.leftovers
         let context = makeClassificationContext()
-        let installed = SystemActions.installedApps()
         return await Task.detached(priority: .userInitiated) {
-            AppState.reannotateOpaque(root)
+            let start = ContinuousClock().now
+            let root = scanResult.root
             let classification = classifier.classify(root: root, context: context)
-            var protectedPaths: [String] = []
-            root.walkWithPaths { node, path in
-                if node.isOpaque { return .skipChildren }
-                if node.isProtectedLocation { protectedPaths.append(path); return .skipChildren }
-                return .continue
-            }
-            return PostProcessed(
-                classification: classification,
-                leftovers: leftovers?.findLeftovers(in: root, context: context, installed: installed) ?? [],
-                largest: inventory?.largestFiles(in: root, limit: 500, measure: .allocated) ?? [],
-                types: inventory?.fileTypes(in: root, limit: 300) ?? [],
-                similar: similarDetector?.findSimilarFolders(in: root, minimumBytes: 50_000_000) ?? [],
-                snapshot: ScanSnapshot.capture(from: root, startedAt: startedAt, completedAt: completedAt, volume: nil),
-                candidates: DuplicateCandidate.collect(from: root, minimumBytes: 1 << 20),
-                protectedPaths: protectedPaths
-            )
+            Trace.log("classify", since: start)
+            async let snapshot = { () -> ScanSnapshot in
+                let t = ContinuousClock().now
+                let value = ScanSnapshot.capture(from: root, startedAt: scanResult.startedAt,
+                                                 completedAt: scanResult.completedAt, volume: nil)
+                Trace.log("snapshot capture", since: t)
+                return value
+            }()
+            async let candidates = { () -> [DuplicateCandidate] in
+                let t = ContinuousClock().now
+                let value = DuplicateCandidate.collect(from: root, minimumBytes: 1 << 20)
+                Trace.log("duplicate candidates (\(value.count))", since: t)
+                return value
+            }()
+            let result = await PostProcessed(classification: classification, snapshot: snapshot, candidates: candidates)
+            Trace.log("post-process", since: start)
+            return result
         }.value
     }
 
-    /// Opaque accounting nodes restored from cache lose their annotation.
-    nonisolated private static func reannotateOpaque(_ root: FileTreeNode) {
-        for node in root.children where node.isOpaque && node.annotation == nil {
-            node.annotation = NodeAnnotation(ruleID: "apfs.accounting", title: node.name, safety: .doNotDelete, group: .system,
-                                             reason: "Sized from APFS volume totals. Managed by macOS.")
-        }
-    }
-
-    private func publishCached(_ cachedRoot: FileTreeNode, meta: ScanCacheMeta) async {
-        let processed = await postProcess(cachedRoot, startedAt: meta.scannedAt, completedAt: meta.scannedAt)
-        let report = await volumeInspector.report(forPath: meta.rootPath)
-        let scanResult = ScanResult(root: cachedRoot, options: ScanOptions(rootPath: meta.rootPath), startedAt: meta.scannedAt,
-                                    completedAt: meta.scannedAt, issues: [], unreadableCount: meta.unreadableCount,
-                                    privateSizeSupported: meta.privateSizeSupported, hardLinkDuplicateCount: 0, wasCancelled: false)
-        publish(scanResult, processed, volume: report, restored: true, sinceEventID: meta.fsEventsID)
-    }
-
-    private func publish(_ scanResult: ScanResult, _ processed: PostProcessed, volume report: VolumeSpaceReport?,
-                         restored: Bool, sinceEventID: UInt64? = nil) {
+    private func publish(_ scanResult: ScanResult, _ processed: PostProcessed, volume report: VolumeSpaceReport?) {
         result = scanResult
         root = scanResult.root
         focus = scanResult.root
         selection = nil
         volume = report
         scannedAt = scanResult.completedAt
-        restoredFromCache = restored
         categoryTotals = processed.classification.categoryTotals
-        recommendations = (processed.classification.recommendations + processed.leftovers + syntheticRecommendations(volume: report))
+        recommendations = (processed.classification.recommendations + syntheticRecommendations(volume: report))
             .sorted { $0.reclaimableBytes > $1.reclaimableBytes }
-        largestFiles = processed.largest
-        fileTypes = processed.types
-        similarFolders = processed.similar
         duplicateCandidates = processed.candidates
-        protectedNodes = processed.protectedPaths.compactMap { scanResult.root.descendant(atPath: $0) }
-        opaqueNodes = scanResult.root.children.filter(\.isOpaque)
         treeVersion += 1
         phase = .ready
 
-        if !restored {
-            var snapshot = processed.snapshot
-            snapshot.volume = report
-            Task { await self.saveAndReloadHistory(snapshot) }
-        } else {
-            Task { await self.reloadHistory() }
-        }
+        var snapshot = processed.snapshot
+        snapshot.volume = report
+        Task { await self.saveAndReloadHistory(snapshot) }
         Task { await self.enrichWithGitSignals() }
-        if liveUpdates { startWatching(path: scanResult.root.path, sinceEventID: sinceEventID) }
+        if liveUpdates { startWatching(path: scanResult.root.path) }
     }
 
     private func makeClassificationContext() -> ClassificationContext {
@@ -574,8 +455,7 @@ final class AppState {
     }
 
     func select(_ node: FileTreeNode?) {
-        selection = node
-        loadFolderSeries()
+        if selection !== node { selection = node }
     }
 
     /// Selects a node by path, focusing its parent, and shows the overview.
@@ -584,49 +464,6 @@ final class AppState {
         focus = node.isDirectory && !node.isProtectedLocation && node.hasChildren ? node : (node.parent ?? root)
         select(node)
         sidebarSelection = .section(.overview)
-    }
-
-    // MARK: - Search
-
-    private func scheduleSearch() {
-        searchTask?.cancel()
-        let query = searchText.trimmingCharacters(in: .whitespaces)
-        guard query.count >= 2, root != nil else {
-            searchResults = []
-            isSearching = false
-            return
-        }
-        isSearching = true
-        searchTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(220))
-            guard !Task.isCancelled, let self else { return }
-            let results = await self.search(query)
-            guard !Task.isCancelled else { return }
-            self.searchResults = results
-            self.isSearching = false
-        }
-    }
-
-    /// Case-insensitive name search on the MainActor, yielding every 40k nodes.
-    private func search(_ query: String) async -> [FileTreeNode] {
-        guard let root else { return [] }
-        var matches: [FileTreeNode] = []
-        var stack: [FileTreeNode] = [root]
-        var visited = 0
-        while let node = stack.popLast() {
-            if node !== root, !node.isOpaque,
-               node.name.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil {
-                matches.append(node)
-                if matches.count >= 5_000 { break }
-            }
-            stack.append(contentsOf: node.children)
-            visited += 1
-            if visited % 40_000 == 0 {
-                await Task.yield()
-                if Task.isCancelled { return [] }
-            }
-        }
-        return Array(matches.sorted { $0.metrics.allocatedBytes > $1.metrics.allocatedBytes }.prefix(400))
     }
 
     // MARK: - Volume
@@ -723,7 +560,7 @@ final class AppState {
         cleanupRequest = CleanupRequest(target: target, recommendation: nil, note: "Inside \(annotation.title)")
     }
 
-    /// Duplicates and similar folders: never rule-proven, so always Review First.
+    /// Duplicates are never rule-proven, so always Review First.
     func requestReviewCleanup(path: String, note: String) {
         guard mayModify(path: path), let node = root?.descendant(atPath: path), !node.isOpaque, !node.isProtectedLocation else { return }
         let target = CleanupTarget(path: path, displayName: node.name, safety: .reviewFirst, identity: node.identity,
@@ -748,70 +585,14 @@ final class AppState {
         return outcome
     }
 
-    var batchCandidates: [CleanupRecommendation] {
-        recommendations(for: .safeToClear).filter { $0.isTrashable && mayModify(path: $0.path) }
-    }
-
-    func requestBatchCleanup() {
-        guard !batchCandidates.isEmpty else { return }
-        batchRequest = BatchCleanupRequest(items: batchCandidates)
-    }
-
-    /// Sequential pre-flight + trash. Items that fail a check or need an
-    /// individual acknowledgement are skipped, never forced.
-    func performBatch(_ items: [CleanupRecommendation], progress: @escaping (Int) -> Void) async -> [BatchItemResult] {
-        var results: [BatchItemResult] = []
-        for (index, rec) in items.enumerated() {
-            progress(index)
-            guard let node = root?.descendant(atPath: rec.path) else {
-                results.append(BatchItemResult(recommendation: rec, succeeded: false, detail: "No longer in the scan"))
-                continue
-            }
-            let target = CleanupTarget(path: rec.path, displayName: rec.title, safety: rec.safety, identity: rec.identity,
-                                       metrics: node.metrics, conflictingApplicationBundleIDs: conflictingApps(for: rec.ruleID),
-                                       isDirectory: node.isDirectory)
-            let report = await cleanup.preflight(target)
-            if let failed = report.checks.first(where: { $0.status == .failed }) {
-                results.append(BatchItemResult(recommendation: rec, succeeded: false, detail: failed.title + ": " + failed.detail))
-                continue
-            }
-            if let ack = report.acknowledgementsRequired.first {
-                results.append(BatchItemResult(recommendation: rec, succeeded: false, detail: "Needs individual review — " + ack.title))
-                continue
-            }
-            if let busy = report.checks.first(where: { $0.id == "openFiles" && $0.status == .warning }) {
-                results.append(BatchItemResult(recommendation: rec, succeeded: false, detail: busy.detail))
-                continue
-            }
-            let outcome = await cleanup.moveToTrash(target, report: report)
-            if outcome.succeeded {
-                applyRemoval(path: rec.path)
-                reclaimedThisSession += outcome.reclaimedPrivateBytes
-                results.append(BatchItemResult(recommendation: rec, succeeded: true, detail: formatBytes(outcome.reclaimedPrivateBytes)))
-            } else {
-                results.append(BatchItemResult(recommendation: rec, succeeded: false, detail: outcome.errorMessage ?? "Could not move"))
-            }
-        }
-        progress(items.count)
-        refreshVolume()
-        return results
-    }
-
     private func applyRemoval(path: String) {
         let prefix = path + "/"
         recommendations.removeAll { $0.path == path || $0.path.hasPrefix(prefix) }
         duplicateCandidates.removeAll { $0.path == path || $0.path.hasPrefix(prefix) }
-        largestFiles.removeAll { $0.path == path || $0.path.hasPrefix(prefix) }
-        searchResults.removeAll { $0.path == path || $0.path.hasPrefix(prefix) }
         duplicateGroups = duplicateGroups.compactMap { group in
             var g = group
             g.paths.removeAll { $0 == path || $0.hasPrefix(prefix) }
             return g.paths.count >= 2 ? g : nil
-        }
-        similarFolders = similarFolders.compactMap { group in
-            var g = group
-            g.folders.removeAll { $0.path == path || $0.path.hasPrefix(prefix) }
-            return g.folders.count >= 2 ? g : nil
         }
         guard let node = root?.descendant(atPath: path), node.parent != nil else { return }
         if let focus, focus === node || focus.ancestors.contains(where: { $0 === node }) { self.focus = node.parent }
@@ -874,10 +655,6 @@ final class AppState {
                 diffBaseID = snapshots.dropFirst().first?.id
             }
             await computeDiff()
-            if let series = history as? any SnapshotSeriesProviding {
-                usageSeries = (try? await series.usageSeries()) ?? []
-                forecast = forecaster?.forecast(samples: usageSeries, now: Date())
-            }
         } catch {
             historyError = error.localizedDescription
         }
@@ -903,33 +680,16 @@ final class AppState {
         await reloadHistory()
     }
 
-    private func loadFolderSeries() {
-        guard let node = selection, node.isDirectory, !node.isOpaque,
-              let series = history as? any SnapshotSeriesProviding else {
-            folderSeries = []
-            folderSeriesPath = nil
-            return
-        }
-        let path = node.path
-        guard path != folderSeriesPath else { return }
-        folderSeriesPath = path
-        Task { [weak self] in
-            let samples = (try? await series.sizeSeries(path: path)) ?? []
-            guard self?.folderSeriesPath == path else { return }
-            self?.folderSeries = samples
-        }
-    }
-
     // MARK: - Live updates (FSEvents)
 
     private func liveUpdatesChanged() {
-        if liveUpdates, let root { startWatching(path: root.path, sinceEventID: nil) } else { stopWatching() }
+        if liveUpdates, let root { startWatching(path: root.path) } else { stopWatching() }
     }
 
-    private func startWatching(path: String, sinceEventID: UInt64?) {
+    private func startWatching(path: String) {
         stopWatching()
         let watchPath = path == "/" ? NSHomeDirectory() : path
-        guard let stream = try? watcher.start(paths: [watchPath], latency: 2.5, sinceEventID: sinceEventID) else { return }
+        guard let stream = try? watcher.start(paths: [watchPath], latency: 2.5) else { return }
         watchTask = Task { [weak self] in
             for await batch in stream {
                 self?.absorb(batch)
@@ -1044,5 +804,16 @@ final class AppState {
             lastRescanSummary = "Updated \(spliced) changed folder\(spliced == 1 ? "" : "s") at \(Date().formatted(date: .omitted, time: .shortened))"
             refreshVolume()
         }
+    }
+}
+
+/// `KLAD_TRACE=1` prints phase timings to stderr.
+enum Trace {
+    static let enabled = ProcessInfo.processInfo.environment["KLAD_TRACE"] != nil
+
+    static func log(_ label: String, since start: ContinuousClock.Instant) {
+        guard enabled else { return }
+        let elapsed = ContinuousClock().now - start
+        FileHandle.standardError.write(Data("[klad] \(label): \(elapsed)\n".utf8))
     }
 }

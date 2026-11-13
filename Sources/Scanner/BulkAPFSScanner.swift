@@ -414,6 +414,8 @@ final class ScanSession: @unchecked Sendable {
 
     // MARK: Worker
 
+    static let bulkPrivateSize = ProcessInfo.processInfo.environment["KLAD_BULK_PRIVATESIZE"] != nil
+
     /// IOPOL_TYPE_DISK / IOPOL_SCOPE_THREAD / IOPOL_THROTTLE for gentle rescans.
     static func engageGentleIO() {
         setiopolicy_np(0, 1, 3)
@@ -422,7 +424,10 @@ final class ScanSession: @unchecked Sendable {
     private func workerLoop() {
         DatalessMaterializationGuard.engageForCurrentThread()
         if options.lowPriority { Self.engageGentleIO() }
-        var reader = BulkDirectoryReader(requestPrivateSize: options.requestPrivateSize)
+        // Never ask for PRIVATESIZE in bulk (it's what makes scanning slow);
+        // it is looked up per file below, only where APFS flags block sharing.
+        // KLAD_BULK_PRIVATESIZE=1 restores the exhaustive (slow) mode for verification.
+        var reader = BulkDirectoryReader(requestPrivateSize: options.requestPrivateSize && Self.bulkPrivateSize)
         defer { reader.deallocate() }
         while let job = queue.next() {
             var newJobs: [DirectoryWorkQueue.Job] = []
@@ -444,7 +449,8 @@ final class ScanSession: @unchecked Sendable {
         var uniqueBytes: UInt64 = 0
         let guardrail = self.guardrail!
 
-        let result = reader.read(path: job.path, isCancelled: { self.isCancelled }) { entry in
+        let wantPrivateSize = options.requestPrivateSize
+        let result = reader.read(path: job.path, isCancelled: { self.isCancelled }) { entry, directoryFD in
             guard entry.nameLength > 0 else { return }
             let name = entry.name
 
@@ -492,6 +498,18 @@ final class ScanSession: @unchecked Sendable {
             if entry.hasPrivateSize {
                 filePrivate = min(UInt64(max(0, entry.privateSize)), fileAllocated)
                 sawPrivate = true
+            } else if wantPrivateSize && entry.hasExtFlags {
+                sawPrivate = true
+                let mayShare = entry.extFlags & (BSDExtFlags.mayShareBlocks | BSDExtFlags.sharesAllBlocks) != 0
+                if mayShare, fileAllocated > 0, let pointer = entry.namePointer,
+                   let size = BulkDirectoryReader.privateSize(directory: directoryFD, name: pointer) {
+                    filePrivate = min(UInt64(max(0, size)), fileAllocated)
+                } else if mayShare && fileAllocated > 0 {
+                    filePrivate = fileAllocated
+                    flags.insert(.privateSizeUnavailable)
+                } else {
+                    filePrivate = fileAllocated   // APFS reports no shared blocks
+                }
             } else {
                 filePrivate = fileAllocated
                 flags.insert(.privateSizeUnavailable)

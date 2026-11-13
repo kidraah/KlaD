@@ -180,44 +180,8 @@ struct DuplicateDetectorTests {
         }
     }
 
-    @Test func copyNamedFilesAreNeverKept() async throws {
-        let scratch = try ScratchDir("dup"); defer { scratch.cleanup() }
-        let paths = try writeCopies(scratch, ["report copy.pdf", "report 2.pdf", "report (1).pdf", "report-1.pdf", "report.pdf"],
-                                    payload: randomData(2 * MiB))
-        // The original is NEWEST and has the longest path of the group's "clean" names; copies are older.
-        for (index, path) in paths.enumerated() { setModificationTime(path, seconds: 1_000_000 + index * 1000) }
-        setModificationTime(paths[4], seconds: 9_000_000)
-        let groups = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(
-            among: paths.map { candidate($0) }, options: options, progress: nil)
-        let group = try #require(groups.first)
-        #expect(group.paths.first == scratch.path + "/report.pdf")
-        #expect(group.paths.count == 5)
-    }
 
-    @Test func copyNameDetection() {
-        for name in ["a copy.txt", "a copy 2.txt", "a (3).txt", "a-1.txt", "a 2.txt", "Copy of a.txt", "A Copy.TXT"] {
-            #expect(DuplicateDetectorService.isCopyNamed(fileName: name), "\(name)")
-        }
-        for name in ["a.txt", "IMG_1234.jpg", "copyright.txt", "v2.txt", "photo2024.png", "notes.copy"] {
-            #expect(!DuplicateDetectorService.isCopyNamed(fileName: name), "\(name)")
-        }
-    }
 
-    @Test func downloadsTrashBackupAndOldFoldersAreKeptLast() async throws {
-        let scratch = try ScratchDir("dup"); defer { scratch.cleanup() }
-        let paths = try writeCopies(
-            scratch, ["Downloads/a.bin", ".Trash/a.bin", "Backups/a.bin", "old/a.bin", "Projects/a.bin"], payload: randomData(2 * MiB))
-        // Make the low-priority ones the OLDEST so only the location rule can demote them.
-        for (index, path) in paths.enumerated() { setModificationTime(path, seconds: 1_000_000 + index * 1000) }
-        setModificationTime(paths[4], seconds: 9_000_000)
-        // ".Trash" is not allowed by the home policy only at top level; it IS inside home but protected ⇒ filtered out.
-        let groups = try await DuplicateDetectorService(homeDirectory: scratch.path).findDuplicates(
-            among: paths.map { candidate($0) }, options: options, progress: nil)
-        let group = try #require(groups.first)
-        #expect(group.paths.first == scratch.path + "/Projects/a.bin")
-        #expect(!group.paths.contains(scratch.path + "/.Trash/a.bin"), "Trash is protected and never offered")
-        #expect(group.paths.last != scratch.path + "/Projects/a.bin")
-    }
 
     @Test func orderThenOldestThenShortestPath() async throws {
         let scratch = try ScratchDir("dup"); defer { scratch.cleanup() }

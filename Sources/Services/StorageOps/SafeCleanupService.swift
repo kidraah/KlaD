@@ -105,40 +105,7 @@ public final class SafeCleanupService: SafeCleanupPerforming {
             }
         }
 
-        // 8. cloudSynced
-        checks.append(cloudSyncedCheck(for: target.path))
-
-        // 9. largeDelete
-        checks.append(Self.largeDeleteCheck(for: target.metrics))
-
         return PreflightReport(target: target, checks: checks, processesUsingTarget: usage, checkedAt: Date())
-    }
-
-    // MARK: - Cloud / size warnings
-
-    private func cloudSyncedCheck(for path: String) -> PreflightCheck {
-        let title = "Not synced with iCloud"
-        var synced = SystemPolicy.isCloudSynced(path, home: homeDirectory)
-        if !synced, let real = Self.resolvedPath(path), let realHome = Self.resolvedPath(homeDirectory) {
-            synced = SystemPolicy.isCloudSynced(real, home: realHome)
-        }
-        if synced {
-            return PreflightCheck(id: "cloudSynced", title: title, status: .warning,
-                                  detail: "Deleting here also deletes it from iCloud on all your devices.",
-                                  requiresAcknowledgement: true)
-        }
-        return PreflightCheck(id: "cloudSynced", title: title, status: .passed, detail: "Not in an iCloud or File Provider folder.")
-    }
-
-    static func largeDeleteCheck(for metrics: StorageMetrics) -> PreflightCheck {
-        let title = "Size of this delete"
-        if metrics.allocatedBytes >= SystemPolicy.largeDeleteBytes || metrics.itemCount >= SystemPolicy.largeDeleteItems {
-            let size = ByteCountFormatter.string(fromByteCount: Int64(clamping: metrics.allocatedBytes), countStyle: .file)
-            return PreflightCheck(id: "largeDelete", title: title, status: .warning,
-                                  detail: "This is a large delete: \(size) in \(metrics.itemCount) items. Confirm it is what you intend.",
-                                  requiresAcknowledgement: true)
-        }
-        return PreflightCheck(id: "largeDelete", title: title, status: .passed, detail: "Not an unusually large delete.")
     }
 
     // MARK: - System policy / ownership

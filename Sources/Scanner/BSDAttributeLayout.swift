@@ -251,7 +251,8 @@ struct BulkDirectoryReader {
 
     /// Opens `path` (never following a final symlink) and streams every entry.
     /// Returns the errno on failure. `isCancelled` is polled between batches.
-    mutating func read(path: String, isCancelled: () -> Bool, _ body: (inout BulkEntry) -> Void) -> ReadResult {
+    /// `body` also receives the open directory descriptor (for per-entry lookups).
+    mutating func read(path: String, isCancelled: () -> Bool, _ body: (inout BulkEntry, Int32) -> Void) -> ReadResult {
         let fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { return .openFailed(errno) }
         defer { close(fd) }
@@ -264,7 +265,28 @@ struct BulkDirectoryReader {
                 if code == EINTR { continue }
                 return .readFailed(code)
             }
-            BulkEntryParser.forEachEntry(in: UnsafeRawPointer(buffer), count: Int(count), body)
+            BulkEntryParser.forEachEntry(in: UnsafeRawPointer(buffer), count: Int(count)) { entry in body(&entry, fd) }
+        }
+    }
+
+    /// ATTR_CMNEXT_PRIVATESIZE for one entry of an open directory. Asked only for
+    /// files APFS flags as possibly sharing blocks: for every other file the
+    /// private size equals the allocated size, and computing it in bulk is what
+    /// makes a scan ~4× slower.
+    static func privateSize(directory fd: Int32, name: UnsafePointer<UInt8>) -> Int64? {
+        var list = attrlist()
+        list.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
+        list.commonattr = BSDAttr.cmnReturnedAttrs
+        list.forkattr = BSDAttr.extPrivateSize
+        return withUnsafeTemporaryAllocation(byteCount: 64, alignment: 8) { raw -> Int64? in
+            let rc = name.withMemoryRebound(to: CChar.self, capacity: 1) { cName in
+                getattrlistat(fd, cName, &list, raw.baseAddress, raw.count,
+                              UInt(BSDAttr.optAttrCmnExtended) | UInt(FSOPT_NOFOLLOW))
+            }
+            guard rc == 0, let base = raw.baseAddress else { return nil }
+            let returnedFork = base.loadUnaligned(fromByteOffset: 4 + 16, as: UInt32.self)
+            guard returnedFork & BSDAttr.extPrivateSize != 0 else { return nil }
+            return base.loadUnaligned(fromByteOffset: 4 + 20, as: Int64.self)
         }
     }
 }

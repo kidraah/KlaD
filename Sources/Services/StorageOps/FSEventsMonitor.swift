@@ -36,15 +36,8 @@ public final class FSEventsMonitor: FileSystemWatching, @unchecked Sendable {
         return running
     }
 
-    /// `FSEventsGetCurrentEventId()` — persist alongside a scan to replay later.
-    public var currentEventID: UInt64 { FSEventsGetCurrentEventId() }
-
-    /// Starts watching "from now" (no history replay).
+    /// Starts watching from now.
     public func start(paths: [String], latency: TimeInterval) throws -> AsyncStream<DirtyPathBatch> {
-        try start(paths: paths, latency: latency, sinceEventID: nil)
-    }
-
-    public func start(paths: [String], latency: TimeInterval, sinceEventID: UInt64?) throws -> AsyncStream<DirtyPathBatch> {
         let watched = paths.filter { !$0.isEmpty }
         guard !watched.isEmpty else { throw FSEventsMonitorError.noPaths }
 
@@ -68,7 +61,7 @@ public final class FSEventsMonitor: FileSystemWatching, @unchecked Sendable {
         let flags = FSEventStreamCreateFlags(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagWatchRoot)
         guard let created = FSEventStreamCreate(
             kCFAllocatorDefault, fsEventsCallback, &context, watched as CFArray,
-            sinceEventID ?? FSEventStreamEventId(kFSEventStreamEventIdSinceNow), max(0, latency), flags)
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow), max(0, latency), flags)
         else {
             continuation.finish()
             throw FSEventsMonitorError.streamCreationFailed
@@ -161,12 +154,8 @@ public final class FSEventsMonitor: FileSystemWatching, @unchecked Sendable {
         func handle(paths: [String], flags: [UInt32], eventIDs: [UInt64], eventCount: Int) {
             let mapped = paths.map { original(for: Self.stripTrailingSlash($0)) }
             let cover = FSEventsMonitor.minimalCover(paths: mapped, flags: flags)
-            let historyDone = flags.contains { $0 & UInt32(kFSEventStreamEventFlagHistoryDone) != 0 }
-            // A batch carrying only HistoryDone is still delivered (empty cover).
-            guard !cover.isEmpty || historyDone else { return }
-            continuation.yield(DirtyPathBatch(
-                paths: cover, eventCount: eventCount, receivedAt: Date(),
-                historyDone: historyDone, lastEventID: eventIDs.max() ?? 0))
+            guard !cover.isEmpty else { return }
+            continuation.yield(DirtyPathBatch(paths: cover, eventCount: eventCount, receivedAt: Date()))
         }
 
     }

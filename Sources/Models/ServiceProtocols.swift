@@ -382,12 +382,13 @@ public struct DuplicateCandidate: Sendable, Hashable {
                 if node.flags.contains(.package) || node.isProtectedLocation || node.isOpaque { return .skipChildren }
                 return .continue
             }
+            // Cheap checks first; the path policy only for the few large files.
             guard node.kind == .file,
-                  SystemPolicy.mayModify(nodePath, home: home),
                   node.metrics.logicalBytes >= minimumBytes,
                   node.metrics.allocatedBytes > 0,
                   !node.flags.contains(.cloudPlaceholder),
-                  !node.flags.contains(.hardLinkDuplicate)
+                  !node.flags.contains(.hardLinkDuplicate),
+                  SystemPolicy.mayModify(nodePath, home: home)
             else { return .continue }
             result.append(DuplicateCandidate(
                 path: nodePath,
@@ -500,21 +501,17 @@ public enum PreflightStatus: String, Sendable, Hashable, Codable {
 
 public struct PreflightCheck: Sendable, Hashable, Identifiable {
     /// Stable id: "exists", "identity", "safety", "systemPolicy", "ownership",
-    /// "runningApps", "openFiles", "cloudSynced", "largeDelete".
+    /// "runningApps", "openFiles".
     public var id: String
     public var title: String
     public var status: PreflightStatus
     public var detail: String
-    /// A `.warning` the user must explicitly tick before the Trash button enables
-    /// (iCloud-synced items, very large deletes).
-    public var requiresAcknowledgement: Bool
 
-    public init(id: String, title: String, status: PreflightStatus, detail: String, requiresAcknowledgement: Bool = false) {
+    public init(id: String, title: String, status: PreflightStatus, detail: String) {
         self.id = id
         self.title = title
         self.status = status
         self.detail = detail
-        self.requiresAcknowledgement = requiresAcknowledgement
     }
 }
 
@@ -547,10 +544,6 @@ public struct PreflightReport: Sendable, Hashable {
 
     /// No check failed.
     public var canProceed: Bool { !checks.contains { $0.status == .failed } }
-    /// Warnings the user must tick before proceeding.
-    public var acknowledgementsRequired: [PreflightCheck] {
-        checks.filter { $0.requiresAcknowledgement && $0.status == .warning }
-    }
     public var hasWarnings: Bool { checks.contains { $0.status == .warning } }
 }
 
@@ -611,238 +604,20 @@ public struct DirtyPathBatch: Sendable, Hashable {
     /// Raw FSEvents coalesced into this batch.
     public var eventCount: Int
     public var receivedAt: Date
-    /// True when this batch contains kFSEventStreamEventFlagHistoryDone — every
-    /// historical event since `sinceEventID` has been delivered.
-    public var historyDone: Bool
-    /// Highest FSEvents event id in this batch (persist it to resume later).
-    public var lastEventID: UInt64
 
-    public init(paths: [DirtyPath], eventCount: Int, receivedAt: Date, historyDone: Bool = false, lastEventID: UInt64 = 0) {
+    public init(paths: [DirtyPath], eventCount: Int, receivedAt: Date) {
         self.paths = paths
         self.eventCount = eventCount
         self.receivedAt = receivedAt
-        self.historyDone = historyDone
-        self.lastEventID = lastEventID
     }
 }
 
 public protocol FileSystemWatching: AnyObject, Sendable {
     /// Starts an FSEventStream on `paths` (directory-level events, no
     /// kFSEventStreamCreateFlagFileEvents) and yields coalesced batches.
-    /// `sinceEventID` replays history from a persisted event id (nil = now);
-    /// the batch carrying HistoryDone has `historyDone == true` (an empty
-    /// batch is yielded if history held no events). Calling `start` again
-    /// restarts with the new paths.
-    func start(paths: [String], latency: TimeInterval, sinceEventID: UInt64?) throws -> AsyncStream<DirtyPathBatch>
-    /// FSEventsGetCurrentEventId() — persist with a scan to replay later.
-    var currentEventID: UInt64 { get }
+    /// Calling `start` again restarts with the new paths.
+    func start(paths: [String], latency: TimeInterval) throws -> AsyncStream<DirtyPathBatch>
     /// Stops the stream and finishes the AsyncStream. Idempotent.
     func stop()
     var isRunning: Bool { get }
-}
-
-// MARK: - History series (KlaDStorageOps)
-
-/// One point of a folder's size history.
-public struct SizeSample: Sendable, Hashable {
-    public var date: Date
-    public var metrics: StorageMetrics
-
-    public init(date: Date, metrics: StorageMetrics) {
-        self.date = date
-        self.metrics = metrics
-    }
-}
-
-/// One point of a volume's used-space history.
-public struct UsageSample: Sendable, Hashable {
-    public var date: Date
-    /// Volume used capacity (total − available now).
-    public var usedBytes: UInt64
-    public var totalBytes: UInt64
-
-    public init(date: Date, usedBytes: UInt64, totalBytes: UInt64) {
-        self.date = date
-        self.usedBytes = usedBytes
-        self.totalBytes = totalBytes
-    }
-}
-
-public protocol SnapshotSeriesProviding: Sendable {
-    /// The size of `path` in every stored snapshot that recorded it, oldest first.
-    func sizeSeries(path: String) async throws -> [SizeSample]
-    /// Volume usage from every stored snapshot's volume report (any root),
-    /// oldest first, one sample per snapshot, deduplicated by timestamp.
-    func usageSeries() async throws -> [UsageSample]
-}
-
-// MARK: - Fill forecast (KlaDStorageOps)
-
-public enum ForecastOutcome: Sendable, Hashable {
-    /// Not enough history (need ≥ 7 days spanning ≥ 4 distinct days).
-    case insufficientData(daysCovered: Int, distinctDays: Int)
-    /// Flat or shrinking.
-    case notFillingUp(bytesPerDay: Int64)
-    /// Would be full in lowDays…highDays at the current pace.
-    case fillsIn(lowDays: Int, highDays: Int, bytesPerDay: Int64)
-    /// Growing, but the low estimate is beyond two years.
-    case moreThanTwoYears(bytesPerDay: Int64)
-}
-
-public protocol StorageForecasting: Sendable {
-    /// Honest forecast: last sample per day over up to 60 days, sudden one-day
-    /// jumps (> 3× the median absolute daily change and > 5 GB) excluded,
-    /// Theil–Sen slope (median of pairwise slopes) with the range from the
-    /// slopes' quartiles. Never an exact date.
-    func forecast(samples: [UsageSample], now: Date) -> ForecastOutcome
-}
-
-// MARK: - Instant reopen (KlaDStorageOps)
-
-public struct ScanCacheMeta: Sendable, Hashable, Codable {
-    public var rootPath: String
-    public var scannedAt: Date
-    /// FSEvents id at scan completion — replayed on reopen to find changes.
-    public var fsEventsID: UInt64
-    public var privateSizeSupported: Bool
-    public var unreadableCount: Int
-    public var nodeCount: Int
-
-    public init(rootPath: String, scannedAt: Date, fsEventsID: UInt64, privateSizeSupported: Bool, unreadableCount: Int, nodeCount: Int) {
-        self.rootPath = rootPath
-        self.scannedAt = scannedAt
-        self.fsEventsID = fsEventsID
-        self.privateSizeSupported = privateSizeSupported
-        self.unreadableCount = unreadableCount
-        self.nodeCount = nodeCount
-    }
-}
-
-public protocol ScanCaching: Sendable {
-    /// Persists the tree's structure, identities, flags, mtimes and FILE metrics
-    /// (directories are re-aggregated on load). Categories / annotations are not
-    /// stored (re-classified after load). Must only READ the tree.
-    func save(_ root: FileTreeNode, meta: ScanCacheMeta) async throws
-    /// Loads and re-aggregates a cached tree; nil if none. Throws on corruption
-    /// (strict, bounds-checked decoding — never trusts lengths or counts).
-    func load(rootPath: String) async throws -> (root: FileTreeNode, meta: ScanCacheMeta)?
-    /// Metadata of every cached root, newest first.
-    func cachedScans() async -> [ScanCacheMeta]
-    func remove(rootPath: String) async throws
-}
-
-// MARK: - Insights (KlaDIntelligence)
-
-public struct LargeFileEntry: Sendable, Identifiable, Hashable {
-    public var id: String { path }
-    public var path: String
-    public var metrics: StorageMetrics
-    public var category: StorageCategory
-    public var modificationTime: Int64
-    public var flags: NodeFlags
-
-    public init(path: String, metrics: StorageMetrics, category: StorageCategory, modificationTime: Int64, flags: NodeFlags) {
-        self.path = path
-        self.metrics = metrics
-        self.category = category
-        self.modificationTime = modificationTime
-        self.flags = flags
-    }
-}
-
-public struct FileTypeSummary: Sendable, Identifiable, Hashable {
-    public var id: String { key }
-    /// Lowercased extension ("mov"), or "" for files without one.
-    public var key: String
-    public var fileCount: Int
-    public var metrics: StorageMetrics
-    public var category: StorageCategory
-    /// Path of the largest file of this type.
-    public var largestPath: String
-
-    public init(key: String, fileCount: Int, metrics: StorageMetrics, category: StorageCategory, largestPath: String) {
-        self.key = key
-        self.fileCount = fileCount
-        self.metrics = metrics
-        self.category = category
-        self.largestPath = largestPath
-    }
-}
-
-public protocol InventoryReporting: Sendable {
-    /// The `limit` largest regular files by `measure` (bounded heap, O(n log k)).
-    /// Skips opaque nodes and hard-link duplicates.
-    func largestFiles(in root: FileTreeNode, limit: Int, measure: SizeMeasure) -> [LargeFileEntry]
-    /// Per-extension totals, largest first.
-    func fileTypes(in root: FileTreeNode, limit: Int) -> [FileTypeSummary]
-}
-
-public struct SimilarFolder: Sendable, Hashable {
-    public var path: String
-    public var metrics: StorageMetrics
-    public var newestModificationTime: Int64
-
-    public init(path: String, metrics: StorageMetrics, newestModificationTime: Int64) {
-        self.path = path
-        self.metrics = metrics
-        self.newestModificationTime = newestModificationTime
-    }
-}
-
-public struct SimilarFolderGroup: Sendable, Identifiable, Hashable {
-    public enum MatchKind: String, Sendable, Hashable {
-        /// Same children (names and sizes) — almost certainly copies.
-        case identicalContents
-        /// Name variants ("app", "app copy", "app_v2", "New folder (3)") with very similar contents.
-        case nameVariants
-    }
-
-    public var id: String
-    /// Shared base name ("kd").
-    public var title: String
-    public var kind: MatchKind
-    /// 0…1 structural similarity.
-    public var similarity: Double
-    /// Folders, the one most likely to be "the original" first.
-    public var folders: [SimilarFolder]
-    /// Σ private bytes of all folders except the first.
-    public var reclaimableBytes: UInt64
-
-    public init(id: String, title: String, kind: MatchKind, similarity: Double, folders: [SimilarFolder], reclaimableBytes: UInt64) {
-        self.id = id
-        self.title = title
-        self.kind = kind
-        self.similarity = similarity
-        self.folders = folders
-        self.reclaimableBytes = reclaimableBytes
-    }
-}
-
-public protocol SimilarFolderDetecting: Sendable {
-    /// Groups of near-duplicate folders ≥ `minimumBytes`, largest reclaimable
-    /// first. Never descends into rule-matched cleanup targets, packages,
-    /// protected or opaque nodes; never reports a folder and its own ancestor.
-    func findSimilarFolders(in root: FileTreeNode, minimumBytes: UInt64) -> [SimilarFolderGroup]
-}
-
-/// Installed applications, captured on the MainActor (LaunchServices).
-public struct InstalledApps: Sendable, Hashable {
-    /// Lowercased bundle identifiers.
-    public var bundleIDs: Set<String>
-    /// Lowercased app names without ".app".
-    public var names: Set<String>
-
-    public init(bundleIDs: Set<String>, names: Set<String>) {
-        self.bundleIDs = bundleIDs
-        self.names = names
-    }
-}
-
-public protocol LeftoverDetecting: Sendable {
-    /// Hints for app data whose app is gone: direct children of ~/Library/Caches,
-    /// Application Support, Logs, HTTPStorages, WebKit, Saved Application State
-    /// whose bundle id / name matches no installed app, unchanged for 90+ days,
-    /// ≥ minimum size. Group `.appLeftovers`, safety `.reviewFirst`, action
-    /// `.moveToTrash`. Never Apple's (com.apple.*), never protected locations.
-    func findLeftovers(in root: FileTreeNode, context: ClassificationContext, installed: InstalledApps) -> [CleanupRecommendation]
 }

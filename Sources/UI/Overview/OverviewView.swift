@@ -22,7 +22,6 @@ struct OverviewView: View {
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    if app.colorMode == .age { AgeLegend().padding(.bottom, 8) }
                     Divider()
                     PathBar()
                 }
@@ -122,22 +121,6 @@ struct StorageBarView: View {
             items = items.map { Segment(id: $0.id, title: $0.title, bytes: UInt64(Double($0.bytes) * factor), color: $0.color) }
         }
         return items
-    }
-}
-
-struct AgeLegend: View {
-    var body: some View {
-        HStack(spacing: 12) {
-            ForEach(AgeBucket.allCases) { bucket in
-                HStack(spacing: 4) {
-                    Circle().fill(bucket.color).frame(width: 7, height: 7)
-                    Text(bucket.title)
-                }
-            }
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .help("Colored by the newest file inside each item")
     }
 }
 
